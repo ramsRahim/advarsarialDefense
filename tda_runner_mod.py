@@ -10,30 +10,51 @@ import operator
 import clip
 from utils import *
 
+
 def get_arguments():
-    """Get arguments of the test-time adaptation."""
+    """Get arguments for the test-time adaptation."""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', dest='config', required=True, help='settings of TDA on specific dataset in yaml format.')
+    parser.add_argument('--config', dest='config', required=True, help='Settings of TDA on specific dataset in YAML format.')
     parser.add_argument('--datasets', dest='datasets', type=str, required=True, help="Datasets to process, separated by a slash (/). Example: I/A/V/R/S")
     parser.add_argument('--data-root', dest='data_root', type=str, default='./dataset/', help='Path to the datasets directory. Default is ./dataset/')
     parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
 
     args = parser.parse_args()
-
     return args
+
+
+def quantize_to_8bit(tensor):
+    """Quantize tensor to 8-bit and return quantized tensor, scale, and zero point."""
+    min_val, max_val = tensor.min(), tensor.max()
+    scale = (max_val - min_val) / 255.0
+    zero_point = min_val
+
+    quantized_tensor = ((tensor - min_val) / scale).round().clamp(0, 255).to(torch.uint8)
+    return quantized_tensor, scale, zero_point
+
+def dequantize_from_8bit(quantized_tensor, scale, zero_point):
+    """Reconstruct original tensor from 8-bit quantized tensor."""
+    return quantized_tensor.to(torch.float32) * scale + zero_point
+
 
 def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
     """Update cache with new features and loss, maintaining the maximum shot capacity."""
     with torch.no_grad():
         item = features_loss if not include_prob_map else features_loss[:2] + [features_loss[2]]
+        
+        # Quantize the item
+        quantized_item, scale, zero_point = quantize_to_8bit(item[0])  # Quantize feature tensor in item
+        quantized_item = [quantized_item, scale, zero_point] + item[1:]  # Append scale, zero point
+
         if pred in cache:
             if len(cache[pred]) < shot_capacity:
-                cache[pred].append(item)
+                cache[pred].append(quantized_item)
             elif features_loss[1] < cache[pred][-1][1]:
-                cache[pred][-1] = item
+                cache[pred][-1] = quantized_item
             cache[pred] = sorted(cache[pred], key=operator.itemgetter(1))
         else:
-            cache[pred] = [item]
+            cache[pred] = [quantized_item]
+
 
 def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
     """Compute logits using positive/negative cache."""
@@ -42,13 +63,19 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
         cache_values = []
         for class_index in sorted(cache.keys()):
             for item in cache[class_index]:
-                cache_keys.append(item[0])
+                # Dequantize the item for usage
+                quantized_feature, scale, zero_point = item[0], item[1], item[2]
+                dequantized_feature = dequantize_from_8bit(quantized_feature, scale, zero_point)
+                cache_keys.append(dequantized_feature)
+                
                 if neg_mask_thresholds:
-                    cache_values.append(item[2])
+                    cache_values.append(item[3])  # Probability map if needed
                 else:
                     cache_values.append(class_index)
 
-        cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0)
+        cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0).half()  # Ensure cache_keys are in Half precision
+        image_features = image_features.half()  # Convert image_features to Half precision
+        
         if neg_mask_thresholds:
             cache_values = torch.cat(cache_values, dim=0)
             cache_values = (((cache_values > neg_mask_thresholds[0]) & (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
@@ -59,7 +86,7 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
         return alpha * cache_logits
 
-def compute_kv_table_size(cache, feature_dim, quantized=False):
+def compute_kv_table_size(cache, feature_dim, quantized=True):
     """
     Compute the total size of the KV cache in bytes.
 
@@ -158,8 +185,8 @@ def main():
         
         test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess)
         clip_weights = clip_classifier(classnames, template, clip_model)
-        log_file = f"logs_{dataset_name}_tda_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        log_file = f"logs_{dataset_name}_8bitQuantized_tda_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         acc = run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, feature_dim, log_file)
 
 if __name__ == "__main__":
-    main()
+    main() 
