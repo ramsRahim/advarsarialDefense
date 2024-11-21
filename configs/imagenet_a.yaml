@@ -11,7 +11,7 @@ positive:
 negative:
   enabled: True
   shot_capacity: 2
-  alpha: 0.117
+  alpha: 0.118
   beta: 1.0
   entropy_threshold:
     lower: 0.2

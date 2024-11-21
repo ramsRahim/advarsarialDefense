@@ -1,7 +1,7 @@
 import os
 from .utils import Datum, DatasetBase, listdir_nohidden
 
-from .imagenet import ImageNet
+from collections import OrderedDict
 
 template = ["itap of a {}.",
                         "a bad photo of the {}.",
@@ -17,7 +17,7 @@ class ImageNetV2(DatasetBase):
     This dataset is used for testing only.
     """
 
-    dataset_dir = "imagenetv2"
+    dataset_dir = "ImageNetV2"
 
     def __init__(self, root):
         root = os.path.abspath(os.path.expanduser(root))
@@ -26,11 +26,25 @@ class ImageNetV2(DatasetBase):
         self.image_dir = os.path.join(self.dataset_dir, image_dir)
         self.template = template
         text_file = os.path.join(self.dataset_dir, "classnames.txt")
-        classnames = ImageNet.read_classnames(text_file)
+        classnames = self.read_classnames(text_file)
 
         data = self.read_data(classnames)
 
         super().__init__(test=data) 
+
+    def read_classnames(self,text_file):
+        """Return a dictionary containing
+        key-value pairs of <folder name>: <class name>.
+        """
+        classnames = OrderedDict()
+        with open(text_file, "r") as f:
+            lines = f.readlines()
+            for line in lines:
+                line = line.strip().split("\t")
+                folder = line[0]
+                classname = " ".join(line[1:])
+                classnames[folder] = classname
+        return classnames
 
     def read_data(self, classnames):
         image_dir = self.image_dir

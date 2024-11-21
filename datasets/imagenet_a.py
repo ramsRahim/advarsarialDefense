@@ -25,7 +25,7 @@ class ImageNetA(DatasetBase):
     def __init__(self, root):
         root = os.path.abspath(os.path.expanduser(root))
         self.dataset_dir = os.path.join(root, self.dataset_dir)
-        self.image_dir = os.path.join(self.dataset_dir, "imagenet-a")
+        self.image_dir = os.path.join(self.dataset_dir, "imagenet-a/imagenet-a")
         self.template = template
 
         text_file = os.path.join(self.dataset_dir, "classnames.txt")
