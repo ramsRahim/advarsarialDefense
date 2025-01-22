@@ -59,28 +59,38 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
         return alpha * cache_logits
 
-def compute_kv_table_size(cache, feature_dim, quantized=False):
+def get_tensor_size(tensor):
     """
-    Compute the total size of the KV cache in bytes.
+    Calculate the size of a PyTorch tensor in bytes.
 
     Args:
-        cache (dict): The KV cache dictionary.
-        feature_dim (int): Dimensionality of the feature vector (e.g., 512 for CLIP).
-        quantized (bool): Whether the features are quantized (8-bit) or not (32-bit).
-    
+        tensor (torch.Tensor): The input tensor.
+
     Returns:
-        int: Total size of the KV cache in bytes.
+        int: The size of the tensor in bytes.
     """
-    key_size_per_row = feature_dim * (1 if quantized else 4)  # 1 byte for int8, 4 bytes for float32
-    metadata_size_per_row = 4  # Assuming loss (float32)
-    row_size = key_size_per_row + metadata_size_per_row
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError("Input must be a PyTorch tensor.")
     
-    total_rows = sum(len(entries) for entries in cache.values())
-    total_size = total_rows * row_size
-    
+    # print(tensor.element_size())
+    return tensor.element_size() * tensor.numel()
+
+
+def compute_real_cache_size(cache):
+    """
+    Compute the real memory size of a cache (positive or negative) in bytes.
+    """
+    total_size = 0
+    # print(cache.keys())
+    for class_entries in cache.values():
+        for item in class_entries:
+            feature_size = get_tensor_size(item[0])  # Feature embedding
+            metadata_size = sum(get_tensor_size(x) for x in item[1:])  # Loss, scale, zero point, etc.
+            total_size += feature_size + metadata_size
     return total_size
 
-def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, feature_dim, log_file):
+
+def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, log_file):
     with open(log_file, 'w') as log:
         with torch.no_grad():
             pos_cache, neg_cache, accuracies = {}, {}, []
@@ -114,16 +124,16 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, feature_dim
 
                 # Monitor the KV table size
                 if i % 1000 == 0:
-                    pos_cache_size = compute_kv_table_size(pos_cache, feature_dim)
-                    neg_cache_size = compute_kv_table_size(neg_cache, feature_dim)
+                    pos_cache_size = compute_real_cache_size(pos_cache)
+                    neg_cache_size = compute_real_cache_size(neg_cache)
                     log.write(f"---- Iteration {i} ----\n")
                     log.write(f"Positive Cache Size: {pos_cache_size} bytes\n")
                     log.write(f"Negative Cache Size: {neg_cache_size} bytes\n")
                     log.write(f"---- TDA's test accuracy: {sum(accuracies)/len(accuracies):.2f}. ----\n\n")
 
             log.write("---- Final Results ----\n")
-            log.write(f"Positive Cache Size: {compute_kv_table_size(pos_cache, feature_dim)} bytes\n")
-            log.write(f"Negative Cache Size: {compute_kv_table_size(neg_cache, feature_dim)} bytes\n")
+            log.write(f"Positive Cache Size: {compute_real_cache_size(pos_cache)} bytes\n")
+            log.write(f"Negative Cache Size: {compute_real_cache_size(neg_cache)} bytes\n")
             log.write(f"TDA's test accuracy: {sum(accuracies) / len(accuracies):.2f}.\n")
 
     return sum(accuracies) / len(accuracies)
@@ -135,12 +145,6 @@ def main():
     # Initialize CLIP model
     clip_model, preprocess = clip.load(args.backbone)
     clip_model.eval()
-
-    # Dynamically retrieve feature dimension
-    dummy_image = torch.randn(1, 3, 224, 224).cuda()  # Dummy input tensor
-    with torch.no_grad():
-        dummy_features = clip_model.encode_image(dummy_image)
-        feature_dim = dummy_features.shape[1]
 
     # Set random seed
     random.seed(1)
@@ -159,7 +163,7 @@ def main():
         test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess)
         clip_weights = clip_classifier(classnames, template, clip_model)
         log_file = f"logs_{dataset_name}_tda_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        acc = run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, feature_dim, log_file)
+        acc = run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, log_file)
 
 if __name__ == "__main__":
     main()

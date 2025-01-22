@@ -24,83 +24,110 @@ def get_arguments():
     return args
 
 
-def quantize_to_8bit(tensor):
-    """Quantize tensor to 8-bit and return quantized tensor, scale, and zero point."""
-    min_val, max_val = tensor.min(), tensor.max()
-    if min_val == max_val:
-        scale = 1.0
-        zero_point = min_val
-        quantized_tensor = torch.zeros_like(tensor, dtype=torch.uint8)
-    else:
-        scale = (max_val - min_val) / 255.0
-        zero_point = min_val
-        quantized_tensor = ((tensor - min_val) / scale).round().clamp(0, 255).to(torch.uint8)
-    return quantized_tensor, scale, zero_point
+def quantize_item(item, mode='8bit'):
+    """
+    Quantize the entire item, including the feature vector, loss, and optional probability map.
+    
+    Args:
+        item (list): A list containing [feature vector, loss, (optional) probability map].
+        mode (str): Quantization mode ('8bit' or '4bit').
+    
+    Returns:
+        list: A list containing quantized components, each with scale and zero point.
+    """
+    quantized_item = []
+    quantization_mode = {
+        '8bit': {'max_level': 255, 'dtype': torch.quint8},
+        '4bit': {'max_level': 15, 'dtype': torch.quint4x2}
+    }
+
+    if mode not in quantization_mode:
+        raise ValueError("Unsupported quantization mode. Choose '8bit' or '4bit'.")
+
+    max_level = quantization_mode[mode]['max_level']
+    dtype = quantization_mode[mode]['dtype']
+
+    # Quantize each part of the item
+    for tensor in item:
+        if isinstance(tensor, torch.Tensor):  # Only quantize tensors
+            # Ensure the tensor is in Float32
+            tensor = tensor.to(torch.float32)
+            
+            min_val, max_val = tensor.min().item(), tensor.max().item()  # Extract values as floats
+            if min_val == max_val:
+                scale = 1.0
+                zero_point = 0  # Set zero_point to 0 when min_val == max_val
+                q_tensor = torch.quantize_per_tensor(torch.empty_like(tensor), scale=scale, zero_point=zero_point, dtype=dtype)
+            else:
+                scale = (max_val - min_val) / max_level
+                zero_point = int((0 - min_val) / scale)  # Convert zero_point to int
+                q_tensor = torch.quantize_per_tensor(tensor, scale=scale, zero_point=zero_point, dtype=dtype)
+            quantized_item.append((q_tensor, scale, zero_point))
+        else:
+            quantized_item.append(tensor)  # Keep non-tensors as they are
+
+    return quantized_item
 
 
-def quantize_to_4bit(tensor):
-    """Quantize tensor to 4-bit and return quantized tensor, scale, and zero point."""
-    min_val, max_val = tensor.min(), tensor.max()
-    if min_val == max_val:
-        scale = 1.0
-        zero_point = min_val
-        quantized_tensor = torch.zeros_like(tensor, dtype=torch.uint8)
-    else:
-        scale = (max_val - min_val) / 15.0
-        zero_point = min_val
-        quantized_tensor = ((tensor - min_val) / scale).round().clamp(0, 15).to(torch.uint8)
-    return quantized_tensor, scale, zero_point
+def dequantize_item(quantized_item):
+    """
+    Dequantize the entire item.
 
+    Args:
+        quantized_item (list): A list containing quantized components with scale and zero point.
+    
+    Returns:
+        list: A list of dequantized components.
+    """
+    dequantized_item = []
+    for part in quantized_item:
+        if isinstance(part, tuple) and len(part) == 3:  # Quantized part with (tensor, scale, zero_point)
+            q_tensor, scale, zero_point = part
+            dequantized_item.append(q_tensor.dequantize())
+        else:
+            dequantized_item.append(part)  # Non-quantized part
 
-def dequantize(tensor, scale, zero_point):
-    """Reconstruct original tensor from quantized tensor."""
-    return tensor.to(torch.float32) * scale + zero_point
-
+    return dequantized_item
 
 def update_cache(cache, pred, features_loss, shot_capacity, quant_mode, include_prob_map=False):
     """Update cache with new features and loss, maintaining the maximum shot capacity."""
     with torch.no_grad():
+        # Prepare the full item (feature vector, loss, and optional probability map)
         item = features_loss if not include_prob_map else features_loss[:2] + [features_loss[2]]
         
-        # Quantize the item based on the selected mode
-        if quant_mode == '8bit':
-            quantized_item, scale, zero_point = quantize_to_8bit(item[0])
-        elif quant_mode == '4bit':
-            quantized_item, scale, zero_point = quantize_to_4bit(item[0])
-        else:
-            raise ValueError("Unsupported quantization mode!")
-
-        quantized_item = [quantized_item, scale, zero_point] + item[1:]  # Append scale, zero point
+        # Quantize the entire item
+        quantized_item = quantize_item(item, mode=quant_mode)
 
         if pred in cache:
             if len(cache[pred]) < shot_capacity:
                 cache[pred].append(quantized_item)
-            elif features_loss[1] < cache[pred][-1][1]:
+            elif features_loss[1] < cache[pred][-1][1][0].dequantize().item():
                 cache[pred][-1] = quantized_item
-            cache[pred] = sorted(cache[pred], key=operator.itemgetter(1))
+            cache[pred] = sorted(cache[pred], key=lambda x: x[1][0].dequantize().item())  # Sort by dequantized loss value
         else:
             cache[pred] = [quantized_item]
 
 
-def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, quant_mode, neg_mask_thresholds=None):
+
+def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
     """Compute logits using positive/negative cache."""
     with torch.no_grad():
         cache_keys = []
         cache_values = []
         
         for class_index in sorted(cache.keys()):
-            for item in cache[class_index]:
-                quantized_feature, scale, zero_point = item[0], item[1], item[2]
-                dequantized_feature = dequantize(quantized_feature, scale, zero_point)
+            for quantized_item in cache[class_index]:
+                dequantized_item = dequantize_item(quantized_item)
+                feature_vector = dequantized_item[0]  # Dequantized feature vector
 
-                # Ensure the tensor has the correct dimensions
-                if dequantized_feature.dim() == 1:  # If it's a 1D tensor
-                    dequantized_feature = dequantized_feature.unsqueeze(0)  # Add batch dimension
-                cache_keys.append(dequantized_feature)
+                # Ensure correct dimensions
+                if feature_vector.dim() == 1:
+                    feature_vector = feature_vector.unsqueeze(0)  # Add batch dimension
+                cache_keys.append(feature_vector)
 
                 if neg_mask_thresholds:
-                    prob_map = item[3]
-                    if prob_map.dim() == 0:  # Ensure prob_map is at least 1D
+                    prob_map = dequantized_item[2]
+                    if prob_map.dim() == 0:
                         prob_map = prob_map.unsqueeze(0)
                     cache_values.append(prob_map)
                 else:
@@ -111,16 +138,13 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, quant
             return torch.zeros_like(image_features)
 
         # Concatenate cache keys and values
-        cache_keys = torch.cat(cache_keys, dim=0)  # Concatenate into 2D tensor
-        if cache_keys.dim() != 2:
-            raise ValueError(f"cache_keys has invalid dimensions: {cache_keys.shape}")  # Debugging assertion
-
-        cache_keys = cache_keys.permute(1, 0).half()  # Permute and convert to Half precision
+        cache_keys = torch.cat(cache_keys, dim=0)
+        cache_keys = cache_keys.permute(1, 0).half()
         image_features = image_features.half()
 
         if neg_mask_thresholds:
             cache_values = torch.cat(cache_values, dim=0)
-            cache_values = (((cache_values > neg_mask_thresholds[0]) & 
+            cache_values = (((cache_values > neg_mask_thresholds[0]) &
                              (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
         else:
             cache_values = F.one_hot(torch.cat(cache_values, dim=0).to(torch.int64), num_classes=clip_weights.size(1)).cuda().half()
@@ -131,17 +155,50 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, quant
         return alpha * cache_logits
 
 
+def get_tensor_size(tensor):
+    """
+    Calculate the size of a PyTorch tensor in bytes.
 
-def compute_kv_table_size(cache, feature_dim, quant_mode):
-    """Compute the total size of the KV cache in bytes."""
-    key_size_per_row = feature_dim * (1 if quant_mode == '8bit' else 0.5)  # 8-bit = 1 byte, 4-bit = 0.5 byte
-    metadata_size_per_row = 4  # Assuming loss (float32)
-    row_size = key_size_per_row + metadata_size_per_row
-    total_rows = sum(len(entries) for entries in cache.values())
-    return int(total_rows * row_size)
+    Args:
+        tensor (torch.Tensor): The input tensor.
+
+    Returns:
+        int: The size of the tensor in bytes.
+    """
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError("Input must be a PyTorch tensor.")
+    #print(tensor.element_size())
+    return tensor.element_size() * tensor.numel()
 
 
-def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, feature_dim, quant_mode, log_file):
+def compute_real_cache_size(cache):
+    """
+    Compute the real memory size of a cache (positive or negative) in bytes.
+    
+    Args:
+        cache (dict): The cache dictionary, where each entry is a list of quantized items.
+        
+    Returns:
+        int: Total memory size of the cache in bytes.
+    """
+    total_size = 0
+    for class_entries in cache.values():
+        for item in class_entries:
+            if isinstance(item[0], tuple) and isinstance(item[0][0], torch.Tensor):
+                # Extract the quantized tensor and calculate its size
+                quantized_tensor = item[0][0]
+                feature_size = get_tensor_size(quantized_tensor)  # Quantized feature embedding
+                # Add the size of metadata (scale and zero point)
+                scale_size = get_tensor_size(torch.tensor(item[0][1]))  # Scale
+                zero_point_size = get_tensor_size(torch.tensor(item[0][2]))  # Zero point
+                total_size += feature_size + scale_size + zero_point_size
+            else:
+                # Handle other metadata if present (e.g., loss)
+                total_size += sum(get_tensor_size(x) for x in item[1:] if isinstance(x, torch.Tensor))
+    return total_size
+
+
+def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, quant_mode, log_file):
     with open(log_file, 'w') as log:
         pos_cache, neg_cache, accuracies = {}, {}, []
 
@@ -156,26 +213,33 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, feature_dim
                 update_cache(neg_cache, pred, [image_features, loss, prob_map], neg_cfg['shot_capacity'], quant_mode, include_prob_map=True)
 
             final_logits = clip_logits.clone()
+
+            # Compute logits from positive cache
             if pos_cache:
-                final_logits += compute_cache_logits(image_features, pos_cache, pos_cfg['alpha'], pos_cfg['beta'], clip_weights, quant_mode)
+                final_logits += compute_cache_logits(image_features, pos_cache, pos_cfg['alpha'], pos_cfg['beta'], clip_weights)
+
+            # Compute logits from negative cache
             if neg_cache:
-                final_logits -= compute_cache_logits(image_features, neg_cache, neg_cfg['alpha'], neg_cfg['beta'], clip_weights, quant_mode)
+                neg_mask_thresholds = (neg_cfg['mask_threshold']['lower'], neg_cfg['mask_threshold']['upper'])
+                final_logits -= compute_cache_logits(image_features, neg_cache, neg_cfg['alpha'], neg_cfg['beta'], clip_weights, neg_mask_thresholds)
+
+
 
             acc = cls_acc(final_logits, target)
             accuracies.append(acc)
 
             # Monitor the KV table size
             if i % 1000 == 0:
-                pos_cache_size = compute_kv_table_size(pos_cache, feature_dim, quant_mode)
-                neg_cache_size = compute_kv_table_size(neg_cache, feature_dim,quant_mode)
+                pos_cache_size = compute_real_cache_size(pos_cache)
+                neg_cache_size = compute_real_cache_size(neg_cache)
                 log.write(f"---- Iteration {i} ----\n")
                 log.write(f"Positive Cache Size: {pos_cache_size} bytes\n")
                 log.write(f"Negative Cache Size: {neg_cache_size} bytes\n")
                 log.write(f"---- TDA's test accuracy: {sum(accuracies)/len(accuracies):.2f}. ----\n\n")
 
         log.write("---- Final Results ----\n")
-        log.write(f"Positive Cache Size: {compute_kv_table_size(pos_cache, feature_dim,quant_mode)} bytes\n")
-        log.write(f"Negative Cache Size: {compute_kv_table_size(neg_cache, feature_dim,quant_mode)} bytes\n")
+        log.write(f"Positive Cache Size: {compute_real_cache_size(pos_cache)} bytes\n")
+        log.write(f"Negative Cache Size: {compute_real_cache_size(neg_cache)} bytes\n")
         log.write(f"TDA's test accuracy: {sum(accuracies) / len(accuracies):.2f}.\n")
 
     return sum(accuracies) / len(accuracies)
@@ -185,10 +249,6 @@ def main():
     args = get_arguments()
     clip_model, preprocess = clip.load(args.backbone)
     clip_model.eval()
-
-    dummy_image = torch.randn(1, 3, 224, 224).cuda()
-    with torch.no_grad():
-        feature_dim = clip_model.encode_image(dummy_image).shape[1]
 
     datasets = args.datasets.split('/')
     for dataset_name in datasets:
@@ -201,7 +261,7 @@ def main():
         clip_weights = clip_classifier(classnames, template, clip_model)
 
         log_file = f"logs_{dataset_name}_{args.quant_mode}Quantized_tda_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, feature_dim, args.quant_mode, log_file)
+        run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, args.quant_mode, log_file)
 
 
 if __name__ == "__main__":
