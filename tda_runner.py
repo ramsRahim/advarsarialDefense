@@ -9,6 +9,7 @@ import operator
 
 import clip
 from utils import *
+import time
 
 def get_arguments():
     """Get arguments of the test-time adaptation."""
@@ -94,6 +95,9 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, log_file):
     with open(log_file, 'w') as log:
         with torch.no_grad():
             pos_cache, neg_cache, accuracies = {}, {}, []
+            total_lookup_time = 0.0
+            total_inference_time = 0.0
+            num_lookups = 0
 
             # Unpack all hyperparameters
             pos_enabled, neg_enabled = pos_cfg['enabled'], neg_cfg['enabled']
@@ -104,6 +108,8 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, log_file):
 
             # Test-time adaptation
             for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')):
+                start_time = time.time()  # Start inference time measurement
+
                 image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images, clip_model, clip_weights)
                 target, prop_entropy = target.cuda(), get_entropy(loss, clip_weights)
 
@@ -114,29 +120,53 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, log_file):
                     update_cache(neg_cache, pred, [image_features, loss, prob_map], neg_params['shot_capacity'], True)
 
                 final_logits = clip_logits.clone()
+
+                # Measure lookup time for cache
+                lookup_start = time.time()
                 if pos_enabled and pos_cache:
                     final_logits += compute_cache_logits(image_features, pos_cache, pos_params['alpha'], pos_params['beta'], clip_weights)
                 if neg_enabled and neg_cache:
-                    final_logits -= compute_cache_logits(image_features, neg_cache, neg_params['alpha'], neg_params['beta'], clip_weights, (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper']))
+                    final_logits -= compute_cache_logits(image_features, neg_cache, neg_params['alpha'], neg_params['beta'], clip_weights, 
+                                                         (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper']))
+                lookup_end = time.time()
 
-                acc = cls_acc(final_logits, target)  
+                lookup_time = lookup_end - lookup_start
+                total_lookup_time += lookup_time
+                num_lookups += 1
+
+                acc = cls_acc(final_logits, target)
                 accuracies.append(acc)
+
+                inference_time = time.time() - start_time  # Measure total inference time
+                total_inference_time += inference_time
 
                 # Monitor the KV table size
                 if i % 1000 == 0:
                     pos_cache_size = compute_real_cache_size(pos_cache)
                     neg_cache_size = compute_real_cache_size(neg_cache)
+                    avg_lookup_time = total_lookup_time / num_lookups if num_lookups > 0 else 0
+                    avg_inference_time = total_inference_time / (i + 1)
+
                     log.write(f"---- Iteration {i} ----\n")
                     log.write(f"Positive Cache Size: {pos_cache_size} bytes\n")
                     log.write(f"Negative Cache Size: {neg_cache_size} bytes\n")
+                    log.write(f"Average Cache Lookup Time: {avg_lookup_time:.6f} seconds\n")
+                    log.write(f"Average Inference Time: {avg_inference_time:.6f} seconds\n")
                     log.write(f"---- TDA's test accuracy: {sum(accuracies)/len(accuracies):.2f}. ----\n\n")
+
+            # Final logging
+            avg_lookup_time = total_lookup_time / num_lookups if num_lookups > 0 else 0
+            avg_inference_time = total_inference_time / len(loader)
 
             log.write("---- Final Results ----\n")
             log.write(f"Positive Cache Size: {compute_real_cache_size(pos_cache)} bytes\n")
             log.write(f"Negative Cache Size: {compute_real_cache_size(neg_cache)} bytes\n")
+            log.write(f"Average Cache Lookup Time: {avg_lookup_time:.6f} seconds\n")
+            log.write(f"Average Inference Time: {avg_inference_time:.6f} seconds\n")
             log.write(f"TDA's test accuracy: {sum(accuracies) / len(accuracies):.2f}.\n")
 
     return sum(accuracies) / len(accuracies)
+
 
 def main():
     args = get_arguments()

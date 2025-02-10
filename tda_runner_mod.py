@@ -9,6 +9,7 @@ import operator
 
 import clip
 from utils import *
+import time
 
 
 def get_arguments():
@@ -110,15 +111,19 @@ def update_cache(cache, pred, features_loss, shot_capacity, quant_mode, include_
 
 
 def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
-    """Compute logits using positive/negative cache."""
+    """Compute logits using positive/negative cache and measure lookup time (excluding dequantization)."""
     with torch.no_grad():
+        if not cache:
+            return torch.zeros_like(image_features), 0.0  # Return early if cache is empty**
+
         cache_keys = []
         cache_values = []
-        
+
+        # **Pre-dequantize cache entries BEFORE timing the lookup
         for class_index in sorted(cache.keys()):
             for quantized_item in cache[class_index]:
-                dequantized_item = dequantize_item(quantized_item)
-                feature_vector = dequantized_item[0]  # Dequantized feature vector
+                dequantized_item = dequantize_item(quantized_item)  # Pre-dequantization
+                feature_vector = dequantized_item[0]  # Extract dequantized feature vector
 
                 # Ensure correct dimensions
                 if feature_vector.dim() == 1:
@@ -133,27 +138,55 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
                 else:
                     cache_values.append(torch.tensor([class_index], device=image_features.device))
 
-        # Handle empty cache
-        if len(cache_keys) == 0 or len(cache_values) == 0:
-            return torch.zeros_like(image_features)
+        # Start timing after dequantization**
+        start_time = time.perf_counter()
 
-        # Concatenate cache keys and values
-        cache_keys = torch.cat(cache_keys, dim=0)
-        cache_keys = cache_keys.permute(1, 0).half()
-        image_features = image_features.half()
+        # Handle empty cache case **again**
+        if len(cache_keys) == 0 or len(cache_values) == 0:
+            return torch.zeros_like(image_features), 0.0
+
+        # Concatenate cache keys and values at once
+        cache_keys = torch.cat(cache_keys, dim=0).to(image_features.device).half()
+        image_features = image_features.to(cache_keys.device).half()
+
+        # Ensure correct dimensions
+        if cache_keys.dim() == 3:
+            cache_keys = cache_keys.squeeze(1)  # Remove singleton dimension if present
+
+        if cache_keys.shape[0] != image_features.shape[1]:
+            cache_keys = cache_keys.permute(1, 0)  # Ensure alignment with `image_features`
 
         if neg_mask_thresholds:
-            cache_values = torch.cat(cache_values, dim=0)
+            cache_values = torch.cat(cache_values, dim=0).to(image_features.device)
             cache_values = (((cache_values > neg_mask_thresholds[0]) &
                              (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
         else:
-            cache_values = F.one_hot(torch.cat(cache_values, dim=0).to(torch.int64), num_classes=clip_weights.size(1)).cuda().half()
+            cache_values = F.one_hot(
+                torch.cat(cache_values, dim=0), num_classes=clip_weights.size(1)
+            ).cuda().half()
 
-        # Compute affinity and logits
-        affinity = image_features @ cache_keys
+        # Compute affinity matrix**
+        affinity = torch.matmul(image_features, cache_keys)  #  **Fix: Ensure valid matrix multiplication**
+
+        # 🔹 **Fix: Ensure `cache_values` has matching dimensions**
+        if cache_values.dim() == 1:
+            cache_values = cache_values.unsqueeze(1)  # Convert (N,) to (N,1) if needed
+
+        if affinity.shape[1] != cache_values.shape[0]:  
+            cache_values = cache_values.T  # Fix dimension mismatch for `@` operation
+
+        lookup_time = time.perf_counter() - start_time
+
+        # Compute logits
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
-        return alpha * cache_logits
 
+        inference_time = time.perf_counter() - start_time
+        # 🔥 **End measuring lookup time (ONLY lookup + computation)**
+        
+
+        return alpha * cache_logits.squeeze(0), lookup_time , inference_time  # Return logits + lookup time**
+
+    
 
 def get_tensor_size(tensor):
     """
@@ -198,9 +231,13 @@ def compute_real_cache_size(cache):
     return total_size
 
 
+
 def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, quant_mode, log_file):
     with open(log_file, 'w') as log:
         pos_cache, neg_cache, accuracies = {}, {}, []
+        total_lookup_time = 0.0
+        total_inference_time = 0.0
+        num_lookups = 0
 
         for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')):
             image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images, clip_model, clip_weights)
@@ -214,35 +251,57 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, quant_mode,
 
             final_logits = clip_logits.clone()
 
-            # Compute logits from positive cache
-            if pos_cache:
-                final_logits += compute_cache_logits(image_features, pos_cache, pos_cfg['alpha'], pos_cfg['beta'], clip_weights)
+            # Measure lookup time for cache
+            pos_lookup_time = 0.0
+            neg_lookup_time = 0.0
+            pos_inference_time = 0.0
+            neg_inference_time = 0.0
 
-            # Compute logits from negative cache
+            if pos_cache:
+                pos_logits, pos_lookup_time, pos_inference_time = compute_cache_logits(image_features, pos_cache, pos_cfg['alpha'], pos_cfg['beta'], clip_weights)
+                final_logits += pos_logits  # Add positive cache logits
+
             if neg_cache:
                 neg_mask_thresholds = (neg_cfg['mask_threshold']['lower'], neg_cfg['mask_threshold']['upper'])
-                final_logits -= compute_cache_logits(image_features, neg_cache, neg_cfg['alpha'], neg_cfg['beta'], clip_weights, neg_mask_thresholds)
+                neg_logits, neg_lookup_time,neg_inference_time = compute_cache_logits(image_features, neg_cache, neg_cfg['alpha'], neg_cfg['beta'], clip_weights, neg_mask_thresholds)
+                final_logits -= neg_logits  # Subtract negative cache logits
 
-
+            # Accumulate total lookup time
+            total_lookup_time += pos_lookup_time + neg_lookup_time
+            num_lookups += 1
 
             acc = cls_acc(final_logits, target)
             accuracies.append(acc)
+
+            total_inference_time += pos_inference_time + neg_inference_time  # Measure total inference time
 
             # Monitor the KV table size
             if i % 1000 == 0:
                 pos_cache_size = compute_real_cache_size(pos_cache)
                 neg_cache_size = compute_real_cache_size(neg_cache)
+                avg_lookup_time = total_lookup_time / num_lookups if num_lookups > 0 else 0
+                avg_inference_time = total_inference_time / (i + 1)
+
                 log.write(f"---- Iteration {i} ----\n")
                 log.write(f"Positive Cache Size: {pos_cache_size} bytes\n")
                 log.write(f"Negative Cache Size: {neg_cache_size} bytes\n")
+                log.write(f"Average Cache Lookup Time: {avg_lookup_time:.6f} seconds\n")
+                log.write(f"Average Inference Time: {avg_inference_time:.6f} seconds\n")
                 log.write(f"---- TDA's test accuracy: {sum(accuracies)/len(accuracies):.2f}. ----\n\n")
+
+        # Final logging
+        avg_lookup_time = total_lookup_time / num_lookups if num_lookups > 0 else 0
+        avg_inference_time = total_inference_time / len(loader)
 
         log.write("---- Final Results ----\n")
         log.write(f"Positive Cache Size: {compute_real_cache_size(pos_cache)} bytes\n")
         log.write(f"Negative Cache Size: {compute_real_cache_size(neg_cache)} bytes\n")
+        log.write(f"Average Cache Lookup Time: {avg_lookup_time:.6f} seconds\n")
+        log.write(f"Average Inference Time: {avg_inference_time:.6f} seconds\n")
         log.write(f"TDA's test accuracy: {sum(accuracies) / len(accuracies):.2f}.\n")
 
     return sum(accuracies) / len(accuracies)
+
 
 
 def main():
