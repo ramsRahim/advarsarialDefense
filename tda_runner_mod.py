@@ -1,4 +1,3 @@
-import random
 import argparse
 from tqdm import tqdm
 from datetime import datetime
@@ -10,7 +9,8 @@ import operator
 import clip
 from utils import *
 import time
-
+import triton
+import triton.language as tl
 
 def get_arguments():
     """Get arguments for the test-time adaptation."""
@@ -25,6 +25,35 @@ def get_arguments():
     return args
 
 
+@triton.jit
+def matmul_kernel(
+    A, B, C, 
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, 
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    """
+    Optimized Triton Kernel for Matrix Multiplication
+    - A: (M, K) -> Image features
+    - B: (K, N) -> Cache keys
+    - C: (M, N) -> Output affinity matrix
+    """
+    pid_m = tl.program_id(0)  # Row ID
+    pid_n = tl.program_id(1)  # Col ID
+
+    off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    off_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(A + off_m[:, None] * K + (off_k + k), mask=(off_m[:, None] < M) & (off_k[None, :] + k < K), other=0)
+        b = tl.load(B + (off_k[:, None] + k) * N + off_n[None, :], mask=(off_k[:, None] + k < K) & (off_n[None, :] < N), other=0)
+        acc += tl.dot(a, b)
+
+    # Store result
+    tl.store(C + off_m[:, None] * N + off_n[None, :], acc, mask=(off_m[:, None] < M) & (off_n[None, :] < N))
+    
 def quantize_item(item, mode='8bit'):
     """
     Quantize the entire item, including the feature vector, loss, and optional probability map.
@@ -110,24 +139,101 @@ def update_cache(cache, pred, features_loss, shot_capacity, quant_mode, include_
 
 
 
+# def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
+#     """Compute logits using positive/negative cache and measure lookup time (excluding dequantization)."""
+#     with torch.no_grad():
+#         if not cache:
+#             return torch.zeros_like(image_features), 0.0  # Return early if cache is empty**
+
+#         cache_keys = []
+#         cache_values = []
+
+#         # **Pre-dequantize cache entries BEFORE timing the lookup
+#         for class_index in sorted(cache.keys()):
+#             for quantized_item in cache[class_index]:
+#                 dequantized_item = dequantize_item(quantized_item)  # Pre-dequantization
+#                 feature_vector = dequantized_item[0]  # Extract dequantized feature vector
+
+#                 # Ensure correct dimensions
+#                 if feature_vector.dim() == 1:
+#                     feature_vector = feature_vector.unsqueeze(0)  # Add batch dimension
+#                 cache_keys.append(feature_vector)
+
+#                 if neg_mask_thresholds:
+#                     prob_map = dequantized_item[2]
+#                     if prob_map.dim() == 0:
+#                         prob_map = prob_map.unsqueeze(0)
+#                     cache_values.append(prob_map)
+#                 else:
+#                     cache_values.append(torch.tensor([class_index], device=image_features.device))
+
+#         # Start timing after dequantization**
+#         start_time = time.perf_counter()
+
+#         # Handle empty cache case **again**
+#         if len(cache_keys) == 0 or len(cache_values) == 0:
+#             return torch.zeros_like(image_features), 0.0
+
+#         # Concatenate cache keys and values at once
+#         cache_keys = torch.cat(cache_keys, dim=0).to(image_features.device).half()
+#         image_features = image_features.to(cache_keys.device).half()
+
+#         # Ensure correct dimensions
+#         if cache_keys.dim() == 3:
+#             cache_keys = cache_keys.squeeze(1)  # Remove singleton dimension if present
+
+#         if cache_keys.shape[0] != image_features.shape[1]:
+#             cache_keys = cache_keys.permute(1, 0)  # Ensure alignment with `image_features`
+
+#         if neg_mask_thresholds:
+#             cache_values = torch.cat(cache_values, dim=0).to(image_features.device)
+#             cache_values = (((cache_values > neg_mask_thresholds[0]) &
+#                              (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
+#         else:
+#             cache_values = F.one_hot(
+#                 torch.cat(cache_values, dim=0), num_classes=clip_weights.size(1)
+#             ).cuda().half()
+
+#         # Compute affinity matrix**
+#         affinity = torch.matmul(image_features, cache_keys)  #  **Fix: Ensure valid matrix multiplication**
+
+#         # 🔹 **Fix: Ensure `cache_values` has matching dimensions**
+#         if cache_values.dim() == 1:
+#             cache_values = cache_values.unsqueeze(1)  # Convert (N,) to (N,1) if needed
+
+#         if affinity.shape[1] != cache_values.shape[0]:  
+#             cache_values = cache_values.T  # Fix dimension mismatch for `@` operation
+
+#         lookup_time = time.perf_counter() - start_time
+
+#         # Compute logits
+#         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
+
+#         inference_time = time.perf_counter() - start_time
+#         # 🔥 **End measuring lookup time (ONLY lookup + computation)**
+        
+
+#         return alpha * cache_logits.squeeze(0), lookup_time , inference_time  # Return logits + lookup time**
+
+
 def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
-    """Compute logits using positive/negative cache and measure lookup time (excluding dequantization)."""
+    """Compute logits using positive/negative cache with Triton optimization."""
     with torch.no_grad():
         if not cache:
-            return torch.zeros_like(image_features), 0.0  # Return early if cache is empty**
+            return torch.zeros_like(image_features), 0.0, 0.0  # Return early if cache is empty
 
         cache_keys = []
         cache_values = []
 
-        # **Pre-dequantize cache entries BEFORE timing the lookup
+        # Pre-dequantize cache BEFORE timing lookup
         for class_index in sorted(cache.keys()):
             for quantized_item in cache[class_index]:
-                dequantized_item = dequantize_item(quantized_item)  # Pre-dequantization
+                dequantized_item = dequantize_item(quantized_item)
                 feature_vector = dequantized_item[0]  # Extract dequantized feature vector
 
                 # Ensure correct dimensions
                 if feature_vector.dim() == 1:
-                    feature_vector = feature_vector.unsqueeze(0)  # Add batch dimension
+                    feature_vector = feature_vector.unsqueeze(0)
                 cache_keys.append(feature_vector)
 
                 if neg_mask_thresholds:
@@ -138,23 +244,19 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
                 else:
                     cache_values.append(torch.tensor([class_index], device=image_features.device))
 
-        # Start timing after dequantization**
-        start_time = time.perf_counter()
 
-        # Handle empty cache case **again**
         if len(cache_keys) == 0 or len(cache_values) == 0:
-            return torch.zeros_like(image_features), 0.0
+            return torch.zeros_like(image_features), 0.0, 0.0
 
-        # Concatenate cache keys and values at once
+        # Convert to CUDA tensors
         cache_keys = torch.cat(cache_keys, dim=0).to(image_features.device).half()
         image_features = image_features.to(cache_keys.device).half()
 
-        # Ensure correct dimensions
         if cache_keys.dim() == 3:
-            cache_keys = cache_keys.squeeze(1)  # Remove singleton dimension if present
+            cache_keys = cache_keys.squeeze(1)
 
         if cache_keys.shape[0] != image_features.shape[1]:
-            cache_keys = cache_keys.permute(1, 0)  # Ensure alignment with `image_features`
+            cache_keys = cache_keys.permute(1, 0)  # Ensure alignment
 
         if neg_mask_thresholds:
             cache_values = torch.cat(cache_values, dim=0).to(image_features.device)
@@ -165,27 +267,32 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
                 torch.cat(cache_values, dim=0), num_classes=clip_weights.size(1)
             ).cuda().half()
 
-        # Compute affinity matrix**
-        affinity = torch.matmul(image_features, cache_keys)  #  **Fix: Ensure valid matrix multiplication**
+        # **TRITON MATRIX MULTIPLICATION**
+        M, K = image_features.shape
+        K, N = cache_keys.shape
 
-        # 🔹 **Fix: Ensure `cache_values` has matching dimensions**
+        BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 16  # Optimize based on GPU
+
+        affinity = torch.empty((M, N), device=image_features.device, dtype=torch.float16)
+
+        matmul_kernel[(M // BLOCK_M, N // BLOCK_N)](
+            image_features, cache_keys, affinity, 
+            M, N, K, BLOCK_M, BLOCK_N, BLOCK_K
+        )
+
+        # Ensure `cache_values` has correct dimensions
         if cache_values.dim() == 1:
-            cache_values = cache_values.unsqueeze(1)  # Convert (N,) to (N,1) if needed
+            cache_values = cache_values.unsqueeze(1)
 
         if affinity.shape[1] != cache_values.shape[0]:  
-            cache_values = cache_values.T  # Fix dimension mismatch for `@` operation
+            cache_values = cache_values.T  # Fix dimension mismatch
 
-        lookup_time = time.perf_counter() - start_time
 
         # Compute logits
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
 
-        inference_time = time.perf_counter() - start_time
-        # 🔥 **End measuring lookup time (ONLY lookup + computation)**
-        
 
-        return alpha * cache_logits.squeeze(0), lookup_time , inference_time  # Return logits + lookup time**
-
+        return alpha * cache_logits.squeeze(0)
     
 
 def get_tensor_size(tensor):
@@ -240,6 +347,7 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, quant_mode,
         num_lookups = 0
 
         for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')):
+            start_time = time.time()
             image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images, clip_model, clip_weights)
             target = target.cuda()
 
@@ -251,29 +359,27 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, quant_mode,
 
             final_logits = clip_logits.clone()
 
-            # Measure lookup time for cache
-            pos_lookup_time = 0.0
-            neg_lookup_time = 0.0
-            pos_inference_time = 0.0
-            neg_inference_time = 0.0
-
+            # Measure lookup time for cache  
+            lookup_start =  time.time()      
             if pos_cache:
-                pos_logits, pos_lookup_time, pos_inference_time = compute_cache_logits(image_features, pos_cache, pos_cfg['alpha'], pos_cfg['beta'], clip_weights)
+                pos_logits = compute_cache_logits(image_features, pos_cache, pos_cfg['alpha'], pos_cfg['beta'], clip_weights)
                 final_logits += pos_logits  # Add positive cache logits
 
             if neg_cache:
                 neg_mask_thresholds = (neg_cfg['mask_threshold']['lower'], neg_cfg['mask_threshold']['upper'])
-                neg_logits, neg_lookup_time,neg_inference_time = compute_cache_logits(image_features, neg_cache, neg_cfg['alpha'], neg_cfg['beta'], clip_weights, neg_mask_thresholds)
+                neg_logits = compute_cache_logits(image_features, neg_cache, neg_cfg['alpha'], neg_cfg['beta'], clip_weights, neg_mask_thresholds)
                 final_logits -= neg_logits  # Subtract negative cache logits
 
             # Accumulate total lookup time
-            total_lookup_time += pos_lookup_time + neg_lookup_time
+            lookup_end = time.time()
+            lookup_time = lookup_end - lookup_start
+            total_lookup_time += lookup_time
             num_lookups += 1
 
             acc = cls_acc(final_logits, target)
             accuracies.append(acc)
-
-            total_inference_time += pos_inference_time + neg_inference_time  # Measure total inference time
+            inference_time = time.time() - start_time  # Measure total inference time
+            total_inference_time += inference_time
 
             # Monitor the KV table size
             if i % 1000 == 0:
@@ -301,7 +407,6 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, quant_mode,
         log.write(f"TDA's test accuracy: {sum(accuracies) / len(accuracies):.2f}.\n")
 
     return sum(accuracies) / len(accuracies)
-
 
 
 def main():
