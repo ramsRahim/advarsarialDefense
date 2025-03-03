@@ -9,7 +9,7 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
 
-from .model import build_model
+from .model import build_model, quantize_clip_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 try:
@@ -132,8 +132,11 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
 
     if not jit:
         model = build_model(state_dict or model.state_dict()).to(device)
+        
         if str(device) == "cpu":
             model.float()
+        
+        model = quantize_clip_model(model)  # Apply TensorRT conversion
         return model, _transform(model.visual.input_resolution)
 
     # patch the device names

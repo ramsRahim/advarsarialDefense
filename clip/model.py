@@ -62,30 +62,42 @@ class AttentionPool2d(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
+        self.softmax = nn.Softmax(dim=-1)  ## ONNX Supported
 
     def forward(self, x):
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x, _ = F.multi_head_attention_forward(
-            query=x, key=x, value=x,
-            embed_dim_to_check=x.shape[-1],
-            num_heads=self.num_heads,
-            q_proj_weight=self.q_proj.weight,
-            k_proj_weight=self.k_proj.weight,
-            v_proj_weight=self.v_proj.weight,
-            in_proj_weight=None,
-            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
-            bias_k=None,
-            bias_v=None,
-            add_zero_attn=False,
-            dropout_p=0,
-            out_proj_weight=self.c_proj.weight,
-            out_proj_bias=self.c_proj.bias,
-            use_separate_proj_weight=True,
-            training=self.training,
-            need_weights=False
-        )
+        # x, _ = F.multi_head_attention_forward(
+        #     query=x, key=x, value=x,
+        #     embed_dim_to_check=x.shape[-1],
+        #     num_heads=self.num_heads,
+        #     q_proj_weight=self.q_proj.weight,  # Use direct attribute access
+        #     k_proj_weight=self.k_proj.weight,  # Use direct attribute access
+        #     v_proj_weight=self.v_proj.weight,  # Use direct attribute access
+        #     in_proj_weight=None,
+        #     in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
+        #     bias_k=None,
+        #     bias_v=None,
+        #     add_zero_attn=False,
+        #     dropout_p=0,
+        #     out_proj_weight=self.c_proj.weight,
+        #     out_proj_bias=self.c_proj.bias,
+        #     use_separate_proj_weight=True,
+        #     training=self.training,
+        #     need_weights=False
+        # )
+
+        ## Manually Compute Attention to Avoid ONNX Unsupported Operators
+        Q = self.q_proj(x)  # Query
+        K = self.k_proj(x)  # Key
+        V = self.v_proj(x)  # Value
+
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / (K.shape[-1] ** 0.5)  # Scaled Dot Product
+        attn_probs = self.softmax(attn_scores)  # Softmax for Attention Weights
+        attn_output = torch.matmul(attn_probs, V)  # Weighted Sum
+
+        x = self.c_proj(attn_output)  # Final Projection
 
         return x[0]
 
@@ -132,15 +144,17 @@ class ModifiedResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
+    def stem(self, x):
+        """Helper function to process stem layers"""
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = self.avgpool(x)
+        return x
+    
     def forward(self, x):
-        def stem(x):
-            for conv, bn in [(self.conv1, self.bn1), (self.conv2, self.bn2), (self.conv3, self.bn3)]:
-                x = self.relu(bn(conv(x)))
-            x = self.avgpool(x)
-            return x
-
         x = x.type(self.conv1.weight.dtype)
-        x = stem(x)
+        x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -177,11 +191,19 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
+        self.softmax = nn.Softmax(dim=-1)  ## ONNX Supported
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        #return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        ##  Manually Implement Attention to Avoid ONNX Unsupported Operators
+        Q, K, V = x, x, x
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / (K.shape[-1] ** 0.5)  # Scaled Dot Product
+        attn_probs = self.softmax(attn_scores)  # Softmax for Attention Weights
+        attn_output = torch.matmul(attn_probs, V)  # Weighted Sum
 
+        return attn_output
+    
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
@@ -430,3 +452,94 @@ def build_model(state_dict: dict):
     convert_weights(model)
     model.load_state_dict(state_dict)
     return model.eval()
+
+
+####### -------       Quantization      --------######
+
+
+
+def quantize_clip_model(model):
+    """Extend CLIP model with INT8 quantization support."""
+    import torch
+    import gc
+    
+    model.eval()
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    # Define wrapper class that adds int8 quantization to encode_image
+    class QuantizedCLIPModel(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+            # Copy all attributes from the original model
+            self.visual = model.visual
+            self.input_resolution = getattr(model, 'input_resolution', 
+                                           getattr(model.visual, 'input_resolution', 224))
+            self.context_length = model.context_length
+            self.vocab_size = model.vocab_size
+            self.transformer = model.transformer
+            self.token_embedding = model.token_embedding
+            self.positional_embedding = model.positional_embedding
+            self.ln_final = model.ln_final
+            self.text_projection = model.text_projection
+            self.logit_scale = model.logit_scale
+            
+            # Store some metadata for quantization
+            self._quantized_initialized = False
+            self._batch_quantized = True  # Use batch quantization by default
+            self._safe_dequantization = True  # Use safe dequantization by default
+            
+        def _safe_normalize(self, tensor, dim=-1, eps=1e-10):
+            """Safely normalize tensor to avoid division by zero."""
+            try:
+                norm = tensor.norm(dim=dim, keepdim=True)
+                # Replace any zeros with epsilon to avoid division by zero
+                norm = torch.where(norm > eps, norm, torch.ones_like(norm) * eps)
+                return tensor / norm
+            except Exception as e:
+                # Fallback in case of any numerical issues
+                print(f"Warning: Safe normalize fallback used: {e}")
+                return tensor / (tensor.norm(dim=dim, keepdim=True) + eps)
+        
+        def encode_image(self, image):
+            """Encode images with int8 quantization."""
+            try:
+                # Get image features at original precision
+                with torch.no_grad():
+                    image_features = self.model.encode_image(image)
+                    
+                    # Make sure the features are float32 for consistent quantization
+                    if image_features.dtype != torch.float32:
+                        image_features = image_features.float()
+                    
+                    # Normalize features
+                    image_features = self._safe_normalize(image_features)
+                    
+                    # Quantize to INT8
+                    scale = torch.max(torch.abs(image_features)) / 127.0
+                    # If scale is zero, set to small positive value
+                    if scale.item() == 0:
+                        scale = torch.tensor(1e-10, device=scale.device)
+                    
+                    zero_point = 0
+                    q_image_features = torch.quantize_per_tensor(
+                        image_features, scale, zero_point, torch.qint8
+                    )
+                    
+                    return q_image_features, scale, zero_point
+            except Exception as e:
+                # If quantization fails, fall back to non-quantized version
+                print(f"Quantization failed, falling back to non-quantized: {e}")
+                return self.model.encode_image(image)
+        
+        def encode_text(self, text):
+            """Encode text without quantization (used for clip_classifier)."""
+            # Text embeddings don't need quantization here
+            return self.model.encode_text(text)
+        
+        def forward(self, image, text):
+            """Original CLIP forward function."""
+            return self.model(image, text)
+    
+    return QuantizedCLIPModel(model)
