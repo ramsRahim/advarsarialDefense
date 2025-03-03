@@ -136,7 +136,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         if str(device) == "cpu":
             model.float()
         
-        model = quantize_clip_model(model)  # Apply TensorRT conversion
+        model = quantize_clip_model(model)  # Apply INT8 quantization
         return model, _transform(model.visual.input_resolution)
 
     # patch the device names
