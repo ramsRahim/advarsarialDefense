@@ -1,19 +1,16 @@
 import random
 import argparse
-import gc
 from tqdm import tqdm
 from datetime import datetime
 
 import torch
 import torch.nn.functional as F
 import operator
-import numpy as np
 
 import clip
 from utils import *
 import time
-import os
-import psutil
+
 
 def get_arguments():
     """Get arguments of the test-time adaptation."""
@@ -22,454 +19,464 @@ def get_arguments():
     parser.add_argument('--datasets', dest='datasets', type=str, required=True, help="Datasets to process, separated by a slash (/). Example: I/A/V/R/S")
     parser.add_argument('--data-root', dest='data_root', type=str, default='./dataset/', help='Path to the datasets directory. Default is ./dataset/')
     parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
-    parser.add_argument('--use-int8', dest='use_int8', action='store_true', help='Use INT8 quantization for features.')
+    parser.add_argument('--quantize', action='store_true', help='Quantize the model.')
 
     args = parser.parse_args()
+
     return args
-
-def monitor_memory():
-    """Monitor memory usage."""
-    process = psutil.Process(os.getpid())
-    mem_info = process.memory_info()
-    return mem_info.rss / (1024 * 1024)  # Return in MB
-
-def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
-    """Update cache with new features and loss, maintaining the maximum shot capacity."""
-    with torch.no_grad():
-        try:
-            # Handle potential scalar or tensor pred
-            pred_key = pred.item() if isinstance(pred, torch.Tensor) else pred
-            
-            # Unpack the features - might be a quantized tuple or regular tensor
-            image_features = features_loss[0]
-            
-            # Handle potential scalar or tensor loss values
-            loss_val = features_loss[1]
-            if isinstance(loss_val, torch.Tensor):
-                if loss_val.numel() == 1:
-                    # Single value tensor
-                    loss_val = loss_val.item()
-                else:
-                    # Multiple values, take mean
-                    loss_val = loss_val.mean().item()
-            
-            # Create the cache item based on whether it includes probability map
-            if include_prob_map:
-                if len(features_loss) > 2:
-                    prob_map = features_loss[2]
-                    item = [image_features, loss_val, prob_map]
-                else:
-                    # Not enough elements, skip this update
-                    return
-            else:
-                item = [image_features, loss_val]
-            
-            # Update the cache based on the prediction key
-            if pred_key in cache:
-                # Cache entry exists for this class
-                if len(cache[pred_key]) < shot_capacity:
-                    # Still have room in the cache
-                    cache[pred_key].append(item)
-                elif loss_val < cache[pred_key][-1][1]:
-                    # Replace worst item in cache with current one
-                    cache[pred_key][-1] = item
-                
-                # Sort entries by loss (lower loss is better)
-                cache[pred_key] = sorted(cache[pred_key], key=operator.itemgetter(1))
-            else:
-                # Create new cache entry for this class
-                cache[pred_key] = [item]
-                
-        except Exception as e:
-            print(f"Error in update_cache: {e}")
-            # Skip this update if there's an error
-
-def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
-    """Compute logits using cache."""
-    with torch.no_grad():
-        try:
-            if not cache:
-                # Determine number of classes
-                if isinstance(clip_weights, list):
-                    num_classes = len(clip_weights)
-                else:
-                    num_classes = clip_weights.size(1)
-                return torch.zeros((1, num_classes), device=image_features.device)
-            
-            # Normalize image features
-            img_features_norm = F.normalize(image_features.float(), p=2, dim=1)
-            
-            # Collect cache keys and values
-            cache_keys = []
-            cache_values = []
-            
-            for class_index in sorted(cache.keys()):
-                for item in cache[class_index]:
-                    # Get the feature vector
-                    feature = item[0]
-                    
-                    # Ensure feature is a tensor of the right type
-                    if not isinstance(feature, torch.Tensor):
-                        continue
-                    
-                    # Normalize feature
-                    feature_norm = F.normalize(feature.float(), p=2, dim=0)
-                    cache_keys.append(feature_norm.unsqueeze(0))
-                    
-                    # Handle values based on cache type
-                    if neg_mask_thresholds and len(item) > 2:
-                        # For negative cache with probability map
-                        cache_values.append(item[2])
-                    else:
-                        # For positive cache with just class index
-                        cache_values.append(class_index)
-            
-            # If no valid items were collected, return zeros
-            if not cache_keys:
-                if isinstance(clip_weights, list):
-                    num_classes = len(clip_weights)
-                else:
-                    num_classes = clip_weights.size(1)
-                return torch.zeros((1, num_classes), device=image_features.device)
-            
-            # Stack all normalized features
-            cache_keys = torch.cat(cache_keys, dim=0).to(image_features.device)
-            
-            # Determine number of classes
-            if isinstance(clip_weights, list):
-                num_classes = len(clip_weights)
-            else:
-                num_classes = clip_weights.size(1)
-            
-            # Compute cosine similarity - but check dimensions first!
-            # Instead of using t() which only works on 2D tensors, use permute or transpose
-            if cache_keys.dim() > 2:
-                # Handle 3D tensor - reshape or squeeze as needed
-                if cache_keys.size(1) == 1:  # If middle dimension is 1, we can squeeze
-                    cache_keys = cache_keys.squeeze(1)
-                else:
-                    # Reshape to 2D by flattening the last dimensions
-                    cache_keys = cache_keys.reshape(cache_keys.size(0), -1)
-            
-            # Now we can safely compute the affinity
-            affinity = img_features_norm @ cache_keys.transpose(0, 1)
-            
-            # Process based on cache type
-            if neg_mask_thresholds and len(cache_values) > 0 and isinstance(cache_values[0], torch.Tensor):
-                # For negative cache - use probability maps with thresholds
-                prob_maps = torch.cat([p.unsqueeze(0) if p.dim() == 1 else p for p in cache_values], dim=0).to(image_features.device)
-                
-                # Apply thresholds to create masks
-                masks = ((prob_maps > neg_mask_thresholds[0]) & 
-                        (prob_maps < neg_mask_thresholds[1])).float()
-                
-                # Compute weighted affinities
-                exp_affinity = torch.exp((-1) * (beta - beta * affinity))
-                
-                # Initialize logits
-                cache_logits = torch.zeros((img_features_norm.shape[0], num_classes), device=img_features_norm.device)
-                
-                # Apply mask for each class
-                for c in range(num_classes):
-                    if masks.shape[1] > c:  # Check if this class exists in the mask
-                        class_mask = masks[:, c]
-                        cache_logits[:, c] = exp_affinity @ class_mask
-            else:
-                # For positive cache - use class indices
-                one_hot = F.one_hot(torch.tensor(cache_values, device=image_features.device), 
-                                 num_classes=num_classes).float()
-                
-                # Compute weighted logits
-                exp_affinity = torch.exp((-1) * (beta - beta * affinity))
-                cache_logits = exp_affinity @ one_hot
-            
-            return alpha * cache_logits
-        
-        except Exception as e:
-            print(f"Error in compute_cache_logits: {e}")
-            # Return zeros as fallback
-            if isinstance(clip_weights, list):
-                num_classes = len(clip_weights)
-            else:
-                num_classes = clip_weights.size(1)
-            return torch.zeros((1, num_classes), device=image_features.device)
 
 def get_tensor_size(tensor):
     """Calculate the size of a PyTorch tensor in bytes."""
     if not isinstance(tensor, torch.Tensor):
-        return 8  # Default size for non-tensors
+        return 0
     
     return tensor.element_size() * tensor.nelement()
 
-def compute_real_cache_size(cache):
-    """Compute the real memory size of a cache in bytes."""
-    try:
-        total_size = 0
-        for class_entries in cache.values():
-            for item in class_entries:
-                # Calculate size of feature embedding (first element)
-                feature_size = get_tensor_size(item[0]) if isinstance(item[0], torch.Tensor) else 8
-                
-                # Calculate size of metadata (remaining elements)
-                metadata_size = sum(get_tensor_size(x) if isinstance(x, torch.Tensor) else 8 for x in item[1:])
-                
-                total_size += feature_size + metadata_size
-        return total_size
-    except Exception as e:
-        print(f"Error calculating cache size: {e}")
-        return 0
 
-def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, log_file, use_int8=False):
+def compute_real_cache_size(cache):
+    """Compute the real memory size of a cache in bytes, handling INT8 quantized features."""
+    total_size = 0
+    for class_entries in cache.values():
+        for item in class_entries:
+            # Handle feature tuple format: (int8_tensor, scale)
+            features = item[0]
+            if isinstance(features, tuple) and len(features) == 2:
+                int8_tensor, scale = features
+                if isinstance(int8_tensor, torch.Tensor):
+                    total_size += get_tensor_size(int8_tensor)
+                if isinstance(scale, torch.Tensor):
+                    total_size += get_tensor_size(scale)
+            elif isinstance(features, torch.Tensor):
+                total_size += get_tensor_size(features)
+            
+            # Handle loss value (should be scalar now)
+            if isinstance(item[1], torch.Tensor):
+                total_size += get_tensor_size(item[1])
+            
+            # Handle prob_map if present (for negative cache)
+            if len(item) > 2 and isinstance(item[2], torch.Tensor):
+                total_size += get_tensor_size(item[2])
+    
+    return total_size
+
+def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
+    """Update cache with pure INT8 quantized features."""
+    with torch.no_grad():
+        # Extract features
+        image_features = features_loss[0]
+        device = image_features.device if not isinstance(image_features, tuple) else image_features[0].device
+        
+        # Ensure we're storing INT8 features
+        if not isinstance(image_features, tuple):
+            # Quantize to INT8
+            feat_max = torch.max(torch.abs(image_features)).detach()
+            feat_scale = feat_max / 127.0 if feat_max > 0 else torch.tensor(1.0, device=device)
+            feat_int8 = torch.round(image_features / feat_scale).clamp(-127, 127).to(dtype=torch.int8, device=device)
+            image_features = (feat_int8, feat_scale)
+        
+        # Extract loss value
+        if torch.is_tensor(features_loss[1]):
+            if features_loss[1].numel() > 1:
+                loss_value = features_loss[1].mean().item()
+            else:
+                loss_value = features_loss[1].item()
+        else:
+            loss_value = features_loss[1]
+        
+        # Create cache item
+        item = [image_features, loss_value]
+        if include_prob_map and len(features_loss) > 2:
+            item.append(features_loss[2])
+            
+        # Update cache with sorted insertion
+        if pred in cache:
+            if len(cache[pred]) < shot_capacity:
+                cache[pred].append(item)
+            elif loss_value < cache[pred][-1][1]:
+                cache[pred][-1] = item
+            cache[pred] = sorted(cache[pred], key=lambda x: x[1])
+        else:
+            cache[pred] = [item]
+            
+# def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
+#     """Update cache with INT8 quantized features."""
+#     with torch.no_grad():
+#         # Get image features and device
+#         image_features = features_loss[0]
+#         if isinstance(image_features, tuple) and len(image_features) == 2:
+#             # Already quantized
+#             feat_int8, feat_scale = image_features
+#             device = feat_int8.device
+#         else:
+#             device = image_features.device
+#             # Quantize to INT8
+#             feat_max = torch.max(torch.abs(image_features)).detach()
+#             if feat_max > 0:
+#                 feat_scale = feat_max / 127.0
+#             else:
+#                 feat_scale = torch.tensor(1.0, device=device)
+            
+#             # Round and clamp to INT8 range
+#             feat_int8 = torch.round(image_features / feat_scale).clamp(-127, 127).to(dtype=torch.int8, device=device)
+#             image_features = (feat_int8, feat_scale)
+        
+#         # Process loss value
+#         if torch.is_tensor(features_loss[1]):
+#             if features_loss[1].numel() > 1:
+#                 loss_value = features_loss[1].mean().item()
+#             else:
+#                 loss_value = features_loss[1].item()
+#         else:
+#             loss_value = features_loss[1]
+        
+#         # Create cache item
+#         item = [image_features, loss_value]
+        
+#         # Add probability map if needed
+#         if include_prob_map and len(features_loss) > 2:
+#             item.append(features_loss[2])
+            
+#         # Update cache
+#         if pred in cache:
+#             if len(cache[pred]) < shot_capacity:
+#                 cache[pred].append(item)
+#             elif loss_value < cache[pred][-1][1]:
+#                 cache[pred][-1] = item
+                
+#             # Sort by loss value
+#             cache[pred] = sorted(cache[pred], key=lambda x: x[1])
+#         else:
+#             cache[pred] = [item]
+            
+# def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
+#     """Compute cache logits with INT8 quantization when possible."""
+#     with torch.no_grad():
+#         try:
+#             # Get device
+#             device = clip_weights.device
+            
+#             # Check if using quantized features
+#             if isinstance(image_features, tuple) and len(image_features) == 2:
+#                 img_int8, img_scale = image_features
+#                 img_int8 = img_int8.to(device)
+#                 if isinstance(img_scale, torch.Tensor):
+#                     img_scale = img_scale.to(device)
+#             else:
+#                 # Fall back to float computation for non-quantized features
+#                 return compute_cache_logits_float(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds)
+            
+#             # Initialize output tensor
+#             batch_size = img_int8.shape[0]
+#             logits = torch.zeros((batch_size, clip_weights.size(1)), device=device)
+            
+#             # Process each class
+#             for cls_id, items in cache.items():
+#                 if len(items) == 0:
+#                     continue
+                    
+#                 cls_sim = torch.zeros(batch_size, device=device)
+#                 total_weight = 0.0
+                
+#                 for item in items:
+#                     feat_data = item[0]
+#                     loss_val = item[1]
+                    
+#                     # Extract quantized feature
+#                     if isinstance(feat_data, tuple) and len(feat_data) == 2:
+#                         feat_int8, feat_scale = feat_data
+#                         feat_int8 = feat_int8.to(device)
+#                         if isinstance(feat_scale, torch.Tensor):
+#                             feat_scale = feat_scale.to(device)
+                            
+#                         # Use the triton kernel
+#                         try:
+#                             from utils import triton_int8_matmul
+#                             sim = triton_int8_matmul(img_int8, img_scale, feat_int8, feat_scale)
+#                         except Exception as e:
+#                             # Fallback to float matmul with explicit type conversion
+#                             print(f"Triton kernel error: {e}")
+#                             img_float = img_int8.float() * img_scale
+#                             feat_float = feat_int8.float() * feat_scale
+#                             sim = torch.matmul(img_float, feat_float.t())
+#                     else:
+#                         # Handle non-quantized feature with explicit type conversion
+#                         feat = feat_data.to(device).float()
+#                         img_float = img_int8.float() * img_scale
+#                         sim = torch.matmul(img_float, feat.t())
+                    
+#                     # Apply mask for negative samples
+#                     if neg_mask_thresholds and len(item) > 2:
+#                         mask = item[2].to(device)
+#                         mask = ((mask > neg_mask_thresholds[0]) & 
+#                               (mask < neg_mask_thresholds[1])).float()
+#                         mask_val = mask.mean().item()
+#                         sim = sim * mask_val
+                    
+#                     # Accumulate weighted similarity
+#                     weight = 1.0 / loss_val
+#                     cls_sim += sim.squeeze(1) * weight
+#                     total_weight += weight
+                
+#                 # Apply parameters
+#                 if total_weight > 0:
+#                     logits[:, cls_id] = alpha * (cls_sim / total_weight) * beta
+            
+#             return logits
+                
+#         except Exception as e:
+#             print(f"INT8 computation failed with: {e}. Falling back to float.")
+#             return compute_cache_logits_float(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds)
+ 
+def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
+    """Pure Triton INT8 cache logits computation without fallbacks."""
+    with torch.no_grad():
+        # Get device
+        device = clip_weights.device
+        
+        # Ensure we're working with INT8 quantized features
+        if isinstance(image_features, tuple) and len(image_features) == 2:
+            img_int8, img_scale = image_features
+            img_int8 = img_int8.to(device)
+            if isinstance(img_scale, torch.Tensor):
+                img_scale = img_scale.to(device)
+        else:
+            # Quantize on-the-fly if needed
+            image_features = image_features.to(device)
+            feat_max = torch.max(torch.abs(image_features)).detach()
+            feat_scale = feat_max / 127.0 if feat_max > 0 else torch.tensor(1.0, device=device)
+            img_int8 = torch.round(image_features / feat_scale).clamp(-127, 127).to(dtype=torch.int8, device=device)
+            img_scale = feat_scale
+        
+        # Empty cache check
+        if not cache:
+            return torch.zeros((img_int8.shape[0], clip_weights.size(1)), device=device)
+        
+        # Initialize output tensor
+        batch_size = img_int8.shape[0]
+        logits = torch.zeros((batch_size, clip_weights.size(1)), device=device)
+        
+        # Process each class
+        for cls_id, items in cache.items():
+            if len(items) == 0:
+                continue
+                
+            cls_sim = torch.zeros(batch_size, device=device)
+            total_weight = 0.0
+            
+            for item in items:
+                feat_data = item[0]
+                loss_val = item[1]
+                
+                # Ensure we have INT8 features
+                if isinstance(feat_data, tuple) and len(feat_data) == 2:
+                    feat_int8, feat_scale = feat_data
+                    feat_int8 = feat_int8.to(device)
+                    if isinstance(feat_scale, torch.Tensor):
+                        feat_scale = feat_scale.to(device)
+                else:
+                    # Quantize if not already done - part of the pure INT8 path
+                    feat = feat_data.to(device)
+                    feat_max = torch.max(torch.abs(feat)).detach()
+                    feat_scale = feat_max / 127.0 if feat_max > 0 else torch.tensor(1.0, device=device)
+                    feat_int8 = torch.round(feat / feat_scale).clamp(-127, 127).to(dtype=torch.int8, device=device)
+                
+                # Use Triton kernel directly - no try/except or fallback
+                from utils import triton_int8_matmul
+                sim = triton_int8_matmul(img_int8, img_scale, feat_int8, feat_scale)
+                
+                # Apply mask for negative samples
+                if neg_mask_thresholds and len(item) > 2:
+                    mask = item[2].to(device)
+                    mask = ((mask > neg_mask_thresholds[0]) & 
+                            (mask < neg_mask_thresholds[1])).float()
+                    mask_val = mask.mean()
+                    sim = sim * mask_val
+                
+                # Accumulate weighted similarity
+                weight = 1.0 / loss_val if loss_val > 0 else 1.0
+                cls_sim += sim.squeeze(1) * weight
+                total_weight += weight
+            
+            # Apply parameters
+            if total_weight > 0:
+                logits[:, cls_id] = alpha * (cls_sim / total_weight) * beta
+        
+        return logits
+           
+def compute_cache_logits_float(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
+    """Compute cache logits with float precision with dtype handling."""
+    with torch.no_grad():
+        device = clip_weights.device
+        
+        # Extract image_features if it's a quantized tuple
+        if isinstance(image_features, tuple) and len(image_features) == 2:
+            img_int8, img_scale = image_features
+            image_features = img_int8.float() * img_scale  # Always use float32
+        else:
+            # Convert to float32 explicitly
+            image_features = image_features.float()
+        
+        # Ensure image_features is on the correct device
+        image_features = image_features.to(device)
+        
+        # Initialize output tensor
+        batch_size = image_features.shape[0]
+        logits = torch.zeros((batch_size, clip_weights.size(1)), device=device)
+        
+        # Process each class
+        for cls_id, items in cache.items():
+            if len(items) == 0:
+                continue
+                
+            # Process each cached item
+            cls_sim = torch.zeros(batch_size, device=device)
+            total_weight = 0.0
+            
+            for item in items:
+                # Extract feature - handle both tensor and tuple formats
+                feature = item[0]
+                
+                # Handle quantized features stored as tuples
+                if isinstance(feature, tuple) and len(feature) == 2:
+                    feat_int8, feat_scale = feature
+                    # Convert to float32 explicitly
+                    feature = feat_int8.float() * feat_scale
+                else:
+                    # Convert to float32 explicitly
+                    feature = feature.float()
+                
+                # Ensure feature is on correct device
+                feature = feature.to(device)
+                
+                # Get loss value for weighting
+                loss_val = item[1]
+                weight = 1.0 / loss_val
+                
+                # Compute similarity
+                sim = torch.matmul(image_features, feature.t())
+                
+                # Handle negative masking if needed
+                if neg_mask_thresholds and len(item) > 2:
+                    mask = item[2].to(device)
+                    mask = ((mask > neg_mask_thresholds[0]) & 
+                           (mask < neg_mask_thresholds[1])).float()
+                    mask_val = mask.mean().item()
+                    sim = sim * mask_val
+                
+                # Accumulate weighted similarity
+                cls_sim += sim.squeeze(1) * weight
+                total_weight += weight
+            
+            # Apply parameters
+            if total_weight > 0:
+                logits[:, cls_id] = alpha * (cls_sim / total_weight) * beta
+        
+        return logits
+
+def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, log_file=None):
     with open(log_file, 'w') as log:
+        
         with torch.no_grad():
-            # Initialize variables
             pos_cache, neg_cache, accuracies = {}, {}, []
+            
+            start_time = time.time()
             total_lookup_time = 0.0
             total_inference_time = 0.0
             num_lookups = 0
             
-            # Record starting memory
-            start_memory = monitor_memory()
-            log.write(f"Starting memory usage: {start_memory:.2f} MB\n")
-            log.write(f"Using INT8 quantization: {use_int8}\n")
-
-            # Unpack configuration parameters with safety checks
-            pos_enabled = pos_cfg.get('enabled', False)
-            neg_enabled = neg_cfg.get('enabled', False)
-            
+            #Unpack all hyperparameters
+            pos_enabled, neg_enabled = pos_cfg['enabled'], neg_cfg['enabled']
             if pos_enabled:
-                pos_params = {
-                    'shot_capacity': pos_cfg.get('shot_capacity', 1),
-                    'alpha': pos_cfg.get('alpha', 1.0),
-                    'beta': pos_cfg.get('beta', 1.0)
-                }
-            
+                pos_params = {k: pos_cfg[k] for k in ['shot_capacity', 'alpha', 'beta']}
             if neg_enabled:
-                neg_params = {
-                    'shot_capacity': neg_cfg.get('shot_capacity', 1),
-                    'alpha': neg_cfg.get('alpha', 1.0),
-                    'beta': neg_cfg.get('beta', 1.0),
-                    'entropy_threshold': neg_cfg.get('entropy_threshold', {'lower': 0.3, 'upper': 0.8}),
-                    'mask_threshold': neg_cfg.get('mask_threshold', {'lower': 0.03, 'upper': 1.0})
-                }
-                
-                # Extract entropy and mask thresholds
-                entropy_config = neg_params['entropy_threshold']
-                mask_config = neg_params['mask_threshold']
-                
-                neg_entropy_threshold = (entropy_config['lower'] + entropy_config['upper']) / 2 if isinstance(entropy_config, dict) else 0.5
-                neg_mask_thresholds = (mask_config['lower'], mask_config['upper']) if isinstance(mask_config, dict) else (0.03, 1.0)
+                neg_params = {k: neg_cfg[k] for k in ['shot_capacity', 'alpha', 'beta', 'entropy_threshold', 'mask_threshold']}
 
-            # Iterate through the dataset
+            #Test-time adaptation
             for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')):
-                try:
-                    # Start timing
-                    start_time = time.time()
-                    
-                    # Move inputs to CUDA
-                    images = images.cuda()
-                    target = target.cuda()
-                    
-                    # Get features using the quantized model
-                    # If quantized, encode_image returns (features_int8, scale, zero_point)
-                    image_features = clip_model.encode_image(images)
-                    
-                    # Handle possible return formats
-                    if isinstance(image_features, tuple) and len(image_features) == 3:
-                        # We have quantized features (features_int8, scale, zero_point)
-                        image_features_store = image_features  # Store quantized version
-                        
-                        # Dequantize for computation if the tensor supports it
-                        if hasattr(image_features[0], 'dequantize'):
-                            image_features_use = image_features[0].dequantize()
-                        else:
-                            # If not a quantized tensor, just use as is
-                            image_features_use = image_features[0]
-                    else:
-                        # Regular non-quantized features
-                        image_features_store = image_features
-                        image_features_use = image_features
-                    
-                    # Normalize features for computation
-                    image_features_norm = F.normalize(image_features_use, p=2, dim=1)
-                    
-                    # Compute logits with class weights
-                    if isinstance(clip_weights, list):
-                        class_weights = torch.stack(clip_weights, dim=1).to(image_features_norm.device)
-                    else:
-                        class_weights = clip_weights
-                        
-                    logits = 100. * image_features_norm @ class_weights
-                    
-                    # Get softmax probabilities
-                    loss = F.softmax(logits, dim=1)
-                    
-                    # Get probability map and prediction
-                    prob_map = loss.clone()
-                    pred = torch.argmax(logits, dim=1)
-                    
-                    # Calculate entropy for negative cache
-                    if neg_enabled:
-                        try:
-                            num_classes = len(clip_weights) if isinstance(clip_weights, list) else clip_weights.size(1)
-                            entropy = -torch.sum(loss * torch.log2(loss + 1e-10), dim=1)
-                            prop_entropy = float(entropy.mean() / np.log2(num_classes))
-                        except Exception as e:
-                            log.write(f"Error calculating entropy: {e}\n")
-                            prop_entropy = 0.5  # Default middle value
-                    
-                    # Update caches
-                    if pos_enabled:
-                        update_cache(
-                            pos_cache, 
-                            pred[0],  # Use first prediction
-                            [image_features_store, loss[0].mean()], 
-                            pos_params['shot_capacity']
-                        )
-                    
-                    if neg_enabled and prop_entropy > neg_entropy_threshold:
-                        update_cache(
-                            neg_cache, 
-                            pred[0], 
-                            [image_features_store, loss[0].mean(), prob_map[0]], 
-                            neg_params['shot_capacity'],
-                            True  # Include probability map
-                        )
-                    
-                    # Compute final logits using cache
-                    final_logits = logits.clone()
-                    
-                    # Measure lookup time
-                    lookup_start = time.time()
-                    
-                    # Apply positive cache if enabled and not empty
-                    if pos_enabled and pos_cache:
-                        pos_logits = compute_cache_logits(
-                            image_features_norm,  # Pass normalized features for computation
-                            pos_cache, 
-                            pos_params['alpha'], 
-                            pos_params['beta'], 
-                            clip_weights
-                        )
-                        final_logits += pos_logits
-                    
-                    # Apply negative cache if enabled and not empty
-                    if neg_enabled and neg_cache:
-                        neg_logits = compute_cache_logits(
-                            image_features_norm,  # Pass normalized features for computation
-                            neg_cache, 
-                            neg_params['alpha'], 
-                            neg_params['beta'], 
-                            clip_weights, 
-                            neg_mask_thresholds
-                        )
-                        final_logits -= neg_logits
-                    
-                    # Compute lookup time
-                    lookup_end = time.time()
-                    lookup_time = lookup_end - lookup_start
-                    total_lookup_time += lookup_time
-                    num_lookups += 1
-                    
-                    # Calculate accuracy
-                    acc = cls_acc(final_logits, target)
-                    accuracies.append(acc)
-                    
-                    # Compute total inference time
-                    inference_time = time.time() - start_time
-                    total_inference_time += inference_time
-                    
-                    # Log progress periodically
-                    if i % 1000 == 0:
-                        pos_cache_size = compute_real_cache_size(pos_cache)
-                        neg_cache_size = compute_real_cache_size(neg_cache)
-                        
-                        avg_lookup_time = total_lookup_time / num_lookups if num_lookups > 0 else 0
-                        avg_inference_time = total_inference_time / (i + 1)
-                        
-                        current_memory = monitor_memory()
-                        
-                        log.write(f"---- Iteration {i} ----\n")
-                        log.write(f"Positive Cache Size: {pos_cache_size} bytes\n")
-                        log.write(f"Negative Cache Size: {neg_cache_size} bytes\n")
-                        log.write(f"Memory Usage: {current_memory:.2f} MB\n")
-                        log.write(f"Memory Increase: {current_memory - start_memory:.2f} MB\n")
-                        log.write(f"Average Cache Lookup Time: {avg_lookup_time:.6f} seconds\n")
-                        log.write(f"Average Inference Time: {avg_inference_time:.6f} seconds\n")
-                        log.write(f"Top 1 Accuracy: {sum(accuracies) / len(accuracies):.2f}%\n\n")
-                        
-                        # Force garbage collection
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                start_inference = time.time()
                 
-                except Exception as e:
-                    log.write(f"Error in iteration {i}: {str(e)}\n")
-                    print(f"Error in iteration {i}: {str(e)}")
-                    continue
-            
-            # Calculate final accuracy
-            avg_acc = sum(accuracies) / len(accuracies) if accuracies else 0
-            
-            # Log final results
-            log.write('=' * 50 + '\n')
-            log.write(f"Final Top 1 Accuracy: {avg_acc:.2f}%\n")
-            log.write(f"Final Memory Usage: {monitor_memory():.2f} MB\n")
-            log.write('=' * 50 + '\n')
-            
-            return avg_acc
+                image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images ,clip_model, clip_weights)
+                target, prop_entropy = target.cuda(), get_entropy(loss, clip_weights)
+                    
+                if pos_enabled:
+                    update_cache(pos_cache, pred, [image_features, loss], pos_params['shot_capacity'])
 
+                if neg_enabled and neg_params['entropy_threshold']['lower'] < prop_entropy < neg_params['entropy_threshold']['upper']:
+                    update_cache(neg_cache, pred, [image_features, loss, prob_map], neg_params['shot_capacity'], True)
+
+                final_logits = clip_logits.clone()
+                
+                lookup_start = time.time()
+                
+                if pos_enabled and pos_cache:
+                    final_logits += compute_cache_logits(image_features, pos_cache, pos_params['alpha'], pos_params['beta'], clip_weights)
+                if neg_enabled and neg_cache:
+                    final_logits -= compute_cache_logits(image_features, neg_cache, neg_params['alpha'], neg_params['beta'], clip_weights, (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper']))
+
+                end_lookup = time.time()
+                lookup_time = end_lookup-lookup_start
+                total_lookup_time += lookup_time
+                num_lookups += 1
+                
+                acc = cls_acc(final_logits, target)  
+                accuracies.append(acc)
+                
+                end_inference = time.time()
+                inference_time = end_inference - start_inference
+                total_inference_time += inference_time
+
+                if i%1000==0:
+                    pos_cache_size = compute_real_cache_size(pos_cache)
+                    neg_cache_size = compute_real_cache_size(neg_cache)
+                    
+                    avg_lookup_time = total_lookup_time / num_lookups if num_lookups > 0 else 0
+                    avg_inference_time = total_inference_time / (i + 1)
+                    
+                    # Log the results
+                    log.write(f"---- Iteration {i} ----\n")
+                    log.write(f"Positive Cache Size: {pos_cache_size} bytes\n")
+                    log.write(f"Negative Cache Size: {neg_cache_size} bytes\n")
+                    log.write(f"Average Lookup Time: {avg_lookup_time:.6f} seconds\n")
+                    log.write(f"Average Inference Time: {avg_inference_time:.6f} seconds\n")
+                    log.write(f"Accuracy: {sum(accuracies)/len(accuracies):.2f}\n")
+                    log.write("\n")
+                                 
+                    print("---- TDA's test accuracy: {:.2f}. ----\n".format(sum(accuracies)/len(accuracies)))
+            print("---- TDA's test accuracy: {:.2f}. ----\n".format(sum(accuracies)/len(accuracies)))   
+            log.write(f"Final accuracy: {sum(accuracies)/len(accuracies):.2f}. Total time: {time.time() - start_time:.2f}.\n")
+            return sum(accuracies)/len(accuracies)
+
+    
 def main():
-    # Parse arguments
     args = get_arguments()
     config_path = args.config
-    use_int8 = args.use_int8
-    
-    # Print if using INT8
-    if use_int8:
-        print("Using INT8 quantization for model.")
-    
-    # Set random seed for reproducibility
+    quantize = args.quantize
+    # Initialize CLIP model
+    clip_model, preprocess = clip.load(args.backbone , quantize=quantize)
+    clip_model.eval().cuda()
+
+    # Set random seed
     random.seed(1)
     torch.manual_seed(1)
     
-    # Initialize CLIP model
-    clip_model, preprocess = clip.load(args.backbone, jit=False)  # Disable JIT to allow quantization
-    clip_model.eval()
+    from utils import precompile_triton_kernels
+    precompile_triton_kernels()
     
-    # Apply quantization if requested
-    if use_int8:
-        try:
-            from clip.model import quantize_clip_model
-            # Quantize the model - this uses the implementation from clip/model.py
-            clip_model = quantize_clip_model(clip_model)
-            print("Model quantized successfully using clip/model.py implementation.")
-        except Exception as e:
-            print(f"Error quantizing model: {e}")
-            print("Continuing with non-quantized model.")
-    
-    # Process each dataset
+    # Run TDA on each dataset
     datasets = args.datasets.split('/')
     for dataset_name in datasets:
         print(f"Processing {dataset_name} dataset.")
-        
-        # Get dataset configuration
         cfg = get_config_file(config_path, dataset_name)
         print("\nRunning dataset configurations:")
         print(cfg, "\n")
         
-        # Build data loader and get class information
         test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess)
-        
-        # Create text embeddings for zero-shot classification
         clip_weights = clip_classifier(classnames, template, clip_model)
         
-        # Set up log file
         log_file = f"logs_{dataset_name}_tda_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        
-        # Run test-time adaptation
-        acc = run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, log_file, use_int8)
-        
-        print(f"{dataset_name} dataset processed. Accuracy: {acc:.2f}%")
+        if quantize:
+            log_file = f"logs_{dataset_name}_tda_quantized_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        acc = run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, log_file=log_file)
 
 if __name__ == "__main__":
     main()
