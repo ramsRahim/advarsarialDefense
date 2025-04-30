@@ -9,7 +9,7 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
 
-from .model import build_model , quantize_clip_model
+from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 try:
@@ -87,7 +87,7 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
-def load(name: str, quantize: bool, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
+def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
     """Load a CLIP model
 
     Parameters
@@ -134,10 +134,6 @@ def load(name: str, quantize: bool, device: Union[str, torch.device] = "cuda" if
         model = build_model(state_dict or model.state_dict()).to(device)
         if str(device) == "cpu":
             model.float()
-        
-        if quantize:
-            print("Quantizing model")  
-            model = quantize_clip_model(model)
         return model, _transform(model.visual.input_resolution)
 
     # patch the device names

@@ -50,120 +50,30 @@ def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=Fal
         else:
             cache[pred] = [item]
 
-# def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
-#     """Compute logits using positive/negative cache."""
-#     with torch.no_grad():
-#         cache_keys = []
-#         cache_values = []
-#         for class_index in sorted(cache.keys()):
-#             for item in cache[class_index]:
-#                 cache_keys.append(item[0])
-#                 if neg_mask_thresholds:
-#                     cache_values.append(item[2])
-#                 else:
-#                     cache_values.append(class_index)
-
-#         cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0)
-#         if neg_mask_thresholds:
-#             cache_values = torch.cat(cache_values, dim=0)
-#             cache_values = (((cache_values > neg_mask_thresholds[0]) & (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
-#         else:
-#             cache_values = (F.one_hot(torch.Tensor(cache_values).to(torch.int64), num_classes=clip_weights.size(1))).cuda().half()
-
-#         affinity = image_features @ cache_keys
-#         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
-#         return alpha * cache_logits
-
 def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
-    """Compute logits using INT8 quantized cache."""
+    """Compute logits using positive/negative cache."""
     with torch.no_grad():
-        if not cache:
-            # Determine number of classes
-            if isinstance(clip_weights, list):
-                num_classes = len(clip_weights)
-            else:
-                num_classes = clip_weights.size(1)
-                
-            # Determine device based on image_features type
-            if isinstance(image_features, tuple):
-                device = image_features[0].device
-            else:
-                device = image_features.device
-                
-            return torch.zeros((1, num_classes), device=device)
-        
-        # Dequantize image features if needed
-        if isinstance(image_features, tuple):
-            img_features_int8, img_scale, img_zero_point = image_features
-            img_features_fp = img_features_int8.dequantize()
-        else:
-            img_features_fp = image_features
-        
-        # Normalize image features for cosine similarity
-        img_features_norm = img_features_fp / img_features_fp.norm(dim=-1, keepdim=True)
-        
-        # Collect cache keys and values
-        cache_keys_fp = []
+        cache_keys = []
         cache_values = []
-        
         for class_index in sorted(cache.keys()):
             for item in cache[class_index]:
-                # Extract cached features and metadata
-                cached_features = item[0]
-                
-                # Dequantize if needed
-                if hasattr(cached_features, 'dequantize'):
-                    cached_features_fp = cached_features.dequantize()
-                else:
-                    cached_features_fp = cached_features
-                
-                # Normalize for cosine similarity
-                cached_features_norm = cached_features_fp / cached_features_fp.norm(dim=-1, keepdim=True)
-                cache_keys_fp.append(cached_features_norm)
-                
-                # Prepare values based on whether this is a negative cache
+                cache_keys.append(item[0])
                 if neg_mask_thresholds:
-                    cache_values.append(item[4] if len(item) > 4 else item[2])  # Prob map
+                    cache_values.append(item[2])
                 else:
-                    cache_values.append(class_index)  # Class index
-        
-        # Stack and prepare tensors for computation
-        cache_keys_fp = torch.cat(cache_keys_fp, dim=0).to(img_features_fp.device)
-        
-        # Determine number of classes
-        if isinstance(clip_weights, list):
-            num_classes = len(clip_weights)
-        else:
-            num_classes = clip_weights.size(1)
-            
-        # Compute affinity - standard cosine similarity
-        affinity = img_features_norm @ cache_keys_fp.t()
-        
-        # Prepare cache values tensor
+                    cache_values.append(class_index)
+
+        cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0)
         if neg_mask_thresholds:
-            cache_values = torch.cat(cache_values, dim=0).to(img_features_fp.device)
-            cache_values = (((cache_values > neg_mask_thresholds[0]) & 
-                           (cache_values < neg_mask_thresholds[1])).float())
-            
-            # Apply exponential weighting and matrix multiply
-            cache_logits = torch.zeros((img_features_norm.shape[0], num_classes), 
-                                      device=img_features_norm.device)
-            
-            # Process each class individually for the negative cache
-            exp_affinity = ((-1) * (beta - beta * affinity)).exp()
-            
-            for c in range(num_classes):
-                class_mask = cache_values[:, c] if cache_values.dim() > 1 else cache_values
-                cache_logits[:, c] = exp_affinity @ class_mask
+            cache_values = torch.cat(cache_values, dim=0)
+            cache_values = (((cache_values > neg_mask_thresholds[0]) & (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
         else:
-            # For positive cache - use one-hot encoding
-            one_hot = F.one_hot(torch.tensor(cache_values, device=img_features_fp.device), 
-                              num_classes=num_classes).float()
-            
-            # Apply exponential weighting and matrix multiply 
-            cache_logits = ((-1) * (beta - beta * affinity)).exp() @ one_hot
-        
+            cache_values = (F.one_hot(torch.Tensor(cache_values).to(torch.int64), num_classes=clip_weights.size(1))).cuda().half()
+
+        affinity = image_features @ cache_keys
+        cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
         return alpha * cache_logits
+
     
 
 def get_tensor_size(tensor):
