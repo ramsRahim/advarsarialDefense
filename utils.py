@@ -9,6 +9,7 @@ from datasets import build_dataset
 from datasets.utils import build_data_loader, AugMixAugmenter
 import torchvision.transforms as transforms
 from PIL import Image
+import torch.nn.functional as F
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -142,3 +143,44 @@ def build_test_data_loader(dataset_name, root_path, preprocess, batch_size=1):
         raise "Dataset is not from the chosen list"
     
     return test_loader, dataset.classnames, dataset.template
+
+# ...existing code...
+
+def estimate_lipschitz_for_clip(image_features, clip_weights, epsilon=1e-3):
+    """
+    Estimate Lipschitz constant for a sample in CLIP feature space.
+    Higher values indicate greater sensitivity to perturbations (potential adversarial examples).
+    
+    Args:
+        image_features: Normalized image features
+        clip_model: CLIP model
+        clip_weights: Classifier weights
+        epsilon: Perturbation magnitude
+        
+    Returns:
+        float: Estimated Lipschitz constant
+    """
+    with torch.enable_grad():
+        # Create a copy for gradient computation
+        features = image_features.clone().detach().requires_grad_(True)
+        
+        # Get original probabilities
+        logits_orig = 100.0 * features @ clip_weights
+        probs_orig = F.softmax(logits_orig, dim=-1)
+        
+        # Create small perturbation (while keeping on unit sphere)
+        perturbation = torch.randn_like(features)
+        perturbation = perturbation / perturbation.norm(dim=-1, keepdim=True) * epsilon
+        
+        # Apply perturbation and normalize to stay on unit sphere
+        perturbed_features = features + perturbation
+        perturbed_features = perturbed_features / perturbed_features.norm(dim=-1, keepdim=True)
+        
+        # Get perturbed probabilities
+        logits_pert = 100.0 * perturbed_features @ clip_weights
+        probs_pert = F.softmax(logits_pert, dim=-1)
+        
+        # Calculate output change divided by input change
+        lipschitz = (probs_pert - probs_orig).norm(p=2) / epsilon
+        
+        return lipschitz.item()

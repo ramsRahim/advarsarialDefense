@@ -1,15 +1,16 @@
 import random
 import argparse
+import wandb
 from tqdm import tqdm
 from datetime import datetime
 
 import torch
 import torch.nn.functional as F
 import operator
-
+from clip_attack import fgsm_attack, pgd_attack
 import clip
 from utils import *
-import time
+
 
 def get_arguments():
     """Get arguments of the test-time adaptation."""
@@ -19,36 +20,30 @@ def get_arguments():
     parser.add_argument('--data-root', dest='data_root', type=str, default='./dataset/', help='Path to the datasets directory. Default is ./dataset/')
     parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
 
+     # Add adversarial attack parameters
+    parser.add_argument('--attack', dest='attack', type=str, choices=['none', 'fgsm', 'pgd'], default='none', help='Adversarial attack to apply (none, fgsm, pgd).')
+    parser.add_argument('--epsilon', dest='epsilon', type=float, default=0.03, help='Attack strength (max perturbation).')
+    parser.add_argument('--alpha', dest='alpha', type=float, default=0.007, help='Step size for PGD attack.')
+    parser.add_argument('--iters', dest='iters', type=int, default=10, help='Number of iterations for PGD attack.')
+
     args = parser.parse_args()
 
     return args
 
+
 def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
     """Update cache with new features and loss, maintaining the maximum shot capacity."""
     with torch.no_grad():
-        # Unpack the features, loss, scale, and zero_point
-        image_features, loss = features_loss[0], features_loss[1]
-        scale = features_loss[2] if len(features_loss) > 2 else None
-        zero_point = features_loss[3] if len(features_loss) > 3 else None
-        
-        # Create the cache item
-        if include_prob_map:
-            # For negative cache
-            prob_map = features_loss[4] if len(features_loss) > 4 else None
-            item = [image_features, loss, scale, zero_point, prob_map]
-        else:
-            # For positive cache
-            item = [image_features, loss, scale, zero_point]
-        
-        # Update the cache
+        item = features_loss if not include_prob_map else features_loss[:2] + [features_loss[2]]
         if pred in cache:
             if len(cache[pred]) < shot_capacity:
                 cache[pred].append(item)
-            elif features_loss[1] < cache[pred][-1][1]:  # Compare loss values
+            elif features_loss[1] < cache[pred][-1][1]:
                 cache[pred][-1] = item
             cache[pred] = sorted(cache[pred], key=operator.itemgetter(1))
         else:
             cache[pred] = [item]
+
 
 def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
     """Compute logits using positive/negative cache."""
@@ -74,169 +69,155 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
         return alpha * cache_logits
 
-    
+def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, attack_config=None):
+    with torch.no_grad():
+        # Initialize caches and accuracy list
+        pos_cache, neg_cache, adv_cache, accuracies = {}, {}, {}, []
+        
+        # Unpack hyperparameters
+        pos_enabled, neg_enabled, adv_enabled = pos_cfg['enabled'], neg_cfg['enabled'], adv_cfg['enabled']
+        
+        if pos_enabled:
+            pos_params = {k: pos_cfg[k] for k in ['shot_capacity', 'alpha', 'beta']}
+        
+        if neg_enabled:
+            neg_params = {k: neg_cfg[k] for k in ['shot_capacity', 'alpha', 'beta', 'entropy_threshold', 'mask_threshold']}
+        
+        if adv_enabled:
+            adv_params = {k: adv_cfg[k] for k in ['shot_capacity', 'alpha', 'beta', 'lipschitz_threshold', 'mask_threshold']}
 
-def get_tensor_size(tensor):
-    """
-    Calculate the size of a PyTorch tensor in bytes.
+        # Set up attack if specified
+        attack_type = attack_config.get('type', 'none') if attack_config else 'none'
+        print(f"Running with attack type: {attack_type}")
+        
+        # Statistics for attacks
+        clean_correct, adv_correct = 0, 0
+        total_samples = 0
 
-    Args:
-        tensor (torch.Tensor): The input tensor.
-
-    Returns:
-        int: The size of the tensor in bytes.
-    """
-    if not isinstance(tensor, torch.Tensor):
-        raise ValueError("Input must be a PyTorch tensor.")
-    
-    # print(tensor.element_size())
-    return tensor.element_size() * tensor.numel()
-
-
-def compute_real_cache_size(cache):
-    """
-    Compute the real memory size of a cache (positive or negative) in bytes.
-    """
-    total_size = 0
-    for class_entries in cache.values():
-        for item in class_entries:
-            # Calculate size of feature embedding (first element)
-            feature_size = get_tensor_size(item[0]) if isinstance(item[0], torch.Tensor) else 8  # Default to 8 bytes for non-tensors
+        # Test-time adaptation loop
+        for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')):
+            target = target.cuda()
+            total_samples += target.size(0)
             
-            # Calculate size of metadata (remaining elements)
-            metadata_size = 0
-            for x in item[1:]:
-                if isinstance(x, torch.Tensor):
-                    metadata_size += get_tensor_size(x)
-                elif x is not None:
-                    # For non-tensor values (like scalars), estimate size
-                    metadata_size += 8  # Assume 8 bytes for numbers (like float64)
+            # Get clean predictions first
+            clean_image_features, clean_logits, _, _, _ = get_clip_logits(images, clip_model, clip_weights)
+            clean_pred = clean_logits.argmax(dim=1)
+            clean_correct += (clean_pred == target).sum().item()
             
-            total_size += feature_size + metadata_size
-    return total_size
+            # Apply adversarial attack if specified
+            if attack_type != 'none':
+                # For adversarial training, we need to keep gradients
+                with torch.enable_grad():
+                    if attack_type == 'fgsm':
+                        adv_images = fgsm_attack(
+                            clip_model, images, target, 
+                            attack_config.get('epsilon', 0.03), 
+                            clip_weights
+                        )
+                    elif attack_type == 'pgd':
+                        adv_images = pgd_attack(
+                            clip_model, images, target, 
+                            attack_config.get('epsilon', 0.03),
+                            attack_config.get('alpha', 0.007),
+                            attack_config.get('iters', 10),
+                            clip_weights
+                        )
+                    else:
+                        adv_images = images
+            else:
+                adv_images = images
+            
+            # Now run TDA on the possibly adversarial images
+            image_features, clip_logits, loss, prob_map, pred = get_clip_logits(adv_images, clip_model, clip_weights)
+            prop_entropy = get_entropy(loss, clip_weights)
 
-
-def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights, log_file):
-    with open(log_file, 'w') as log:
-        with torch.no_grad():
-            pos_cache, neg_cache, accuracies = {}, {}, []
-            total_lookup_time = 0.0
-            total_inference_time = 0.0
-            num_lookups = 0
-
-            # Unpack all hyperparameters
-            pos_enabled, neg_enabled = pos_cfg['enabled'], neg_cfg['enabled']
+            # Update positive cache
             if pos_enabled:
-                pos_params = {k: pos_cfg[k] for k in ['shot_capacity', 'alpha', 'beta']}
-            if neg_enabled:
-                neg_params = {k: neg_cfg[k] for k in ['shot_capacity', 'alpha', 'beta', 'entropy_threshold', 'mask_threshold']}
-                
-                # Enhanced extraction of entropy_threshold with better error handling
-                entropy_config = neg_params['entropy_threshold']
-                if isinstance(entropy_config, dict):
-                    neg_entropy_threshold = (entropy_config.get('lower', 0.3) + entropy_config.get('upper', 0.8)) / 2
-                else:
-                    neg_entropy_threshold = 0.5  # Default value
-                    
-                # Process neg_mask_threshold
-                neg_mask_thresholds = (
-                    neg_params['mask_threshold']['lower'],
-                    neg_params['mask_threshold']['upper']
-                )
+                update_cache(pos_cache, pred, [image_features, loss], pos_params['shot_capacity'])
 
-            for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')):
-                try:
-                    start_time = time.time()  # Start inference time measurement
-
-                    # Get image features and logits
-                    image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images, clip_model, clip_weights)
-                    target = target.cuda()
+            # Check if sample should go to negative or adverse cache
+            if (neg_enabled or adv_enabled) and (
+                neg_enabled and 
+                neg_params['entropy_threshold']['lower'] < prop_entropy < neg_params['entropy_threshold']['upper']
+            ):
+                # Sample is eligible for negative/adverse cache
+                if adv_enabled:
+                    # Calculate Lipschitz constant to determine sensitivity
+                    lipschitz = estimate_lipschitz_for_clip(image_features, clip_weights)
                     
-                    # Safely calculate entropy
-                    try:
-                        prop_entropy = get_entropy(loss, clip_weights)
-                    except Exception as e:
-                        log.write(f"Error calculating entropy: {e}\n")
-                        prop_entropy = 0.5  # Default middle value
-                    
-                    # Safe unpacking with error handling
-                    try:
-                        if isinstance(image_features, tuple) and len(image_features) == 3:
-                            img_features_int8, img_scale, img_zero_point = image_features
-                        else:
-                            log.write(f"Warning: Expected tuple of 3 elements but got {type(image_features)}\n")
-                            # Handle the case gracefully with defaults
-                            if isinstance(image_features, tuple):
-                                img_features_int8 = image_features[0]
-                            else:
-                                img_features_int8 = image_features
-                            img_scale = torch.tensor(1.0, device=image_features[0].device if isinstance(image_features, tuple) else image_features.device)
-                            img_zero_point = torch.tensor(0, device=image_features[0].device if isinstance(image_features, tuple) else image_features.device)
-                    except Exception as e:
-                        log.write(f"Error unpacking image_features: {e}\n")
-                        continue  # Skip this iteration
-
-                    # Update caches with quantized features
-                    if pos_enabled:
-                        update_cache(pos_cache, pred, [img_features_int8, loss, img_scale, img_zero_point], 
-                                   pos_params['shot_capacity'])
-                    
-                    if neg_enabled and prop_entropy > neg_entropy_threshold:
-                        update_cache(neg_cache, pred, [img_features_int8, loss, img_scale, img_zero_point, prob_map],
+                    if lipschitz > adv_params['lipschitz_threshold']:
+                        # Highly sensitive sample - add to adverse cache
+                        update_cache(adv_cache, pred, [image_features, loss, prob_map], 
+                                   adv_params['shot_capacity'], True)
+                    elif neg_enabled:
+                        # Regular sample - add to negative cache
+                        update_cache(neg_cache, pred, [image_features, loss, prob_map], 
                                    neg_params['shot_capacity'], True)
-                    
-                    # Compute final logits using quantized cache
-                    final_logits = clip_logits.clone()
+                elif neg_enabled:
+                    # Adverse cache not enabled, use negative cache
+                    update_cache(neg_cache, pred, [image_features, loss, prob_map], 
+                               neg_params['shot_capacity'], True)
 
-                    # Measure lookup time for cache
-                    lookup_start = time.time()
-                    if pos_enabled and pos_cache:
-                        pos_logits = compute_cache_logits(image_features, pos_cache, pos_params['alpha'], pos_params['beta'], clip_weights)
-                        final_logits += pos_logits  # Add positive cache logits
+            # Compute final logits using all caches
+            final_logits = clip_logits.clone()
+            
+            # Add positive cache contribution
+            if pos_enabled and pos_cache:
+                final_logits += compute_cache_logits(
+                    image_features, pos_cache, 
+                    pos_params['alpha'], pos_params['beta'], 
+                    clip_weights
+                )
+            
+            # Subtract negative cache contribution
+            if neg_enabled and neg_cache:
+                final_logits -= compute_cache_logits(
+                    image_features, neg_cache, 
+                    neg_params['alpha'], neg_params['beta'], 
+                    clip_weights, 
+                    (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper'])
+                )
+            
+            # Apply stronger penalty for adverse cache samples
+            if adv_enabled and adv_cache:
+                adv_logits = compute_cache_logits(
+                    image_features, adv_cache, 
+                    adv_params['alpha'], adv_params['beta'], 
+                    clip_weights, 
+                    (adv_params['mask_threshold']['lower'], adv_params['mask_threshold']['upper'])
+                )
+                # Apply higher weight penalty (1.5x) for adverse examples
+                final_logits -= 1.5 * adv_logits
+            
+            # Calculate accuracy and log
+            acc = cls_acc(final_logits, target)  
+            accuracies.append(acc)
+            adv_correct += (final_logits.argmax(dim=1) == target).sum().item()
 
-                    if neg_enabled and neg_cache:
-                        neg_logits = compute_cache_logits(image_features, neg_cache, neg_params['alpha'], neg_params['beta'], clip_weights, neg_mask_thresholds)
-                        final_logits -= neg_logits  # Subtract negative cache logits
-
-                    # Accumulate total lookup time
-                    lookup_end = time.time()
-                    lookup_time = lookup_end - lookup_start
-                    total_lookup_time += lookup_time
-                    num_lookups += 1
-
-                    acc = cls_acc(final_logits, target)
-                    accuracies.append(acc)
-                    inference_time = time.time() - start_time  # Measure total inference time
-                    total_inference_time += inference_time
-
-                    # Monitor the KV table size
-                    if i % 1000 == 0:
-                        pos_cache_size = compute_real_cache_size(pos_cache)
-                        neg_cache_size = compute_real_cache_size(neg_cache)
-                        avg_lookup_time = total_lookup_time / num_lookups if num_lookups > 0 else 0
-                        avg_inference_time = total_inference_time / (i + 1)
-
-                        log.write(f"---- Iteration {i} ----\n")
-                        log.write(f"Positive Cache Size: {pos_cache_size} bytes\n")
-                        log.write(f"Negative Cache Size: {neg_cache_size} bytes\n")
-                        log.write(f"Average Cache Lookup Time: {avg_lookup_time:.6f} seconds\n")
-                        log.write(f"Average Inference Time: {avg_inference_time:.6f} seconds\n")
-                        log.write(f"Top 1 Accuracy: {sum(accuracies) / len(accuracies):.2f}%\n\n")
-                        
-                except Exception as e:
-                    # Catch any exceptions to prevent segfaults
-                    log.write(f"Error in iteration {i}: {str(e)}\n")
-                    print(f"Error in iteration {i}: {str(e)}")
-                    continue  # Skip this iteration
-
-            # Calculate overall accuracy
-            avg_acc = sum(accuracies) / len(accuracies) if accuracies else 0
-
-            log.write('=' * 50 + '\n')
-            log.write(f"Final Top 1 Accuracy: {avg_acc:.2f}%\n")
-            log.write('=' * 50 + '\n')
-
-            return avg_acc
+            # Print progress
+            if i % 1000 == 0:
+                print("---- TDA's test accuracy: {:.2f}. ----".format(sum(accuracies)/len(accuracies)))
+                if adv_enabled:
+                    print(f"Adverse cache entries: {sum(len(v) for v in adv_cache.values())}")
+                if attack_type != 'none':
+                    clean_acc = clean_correct / total_samples * 100
+                    adv_acc = adv_correct / total_samples * 100
+                    print(f"Clean accuracy: {clean_acc:.2f}%, Adversarial accuracy: {adv_acc:.2f}%")
+        
+        # Final accuracy
+        final_acc = sum(accuracies)/len(accuracies)
+        print("---- TDA's test accuracy: {:.2f}. ----".format(final_acc))
+        
+        # Print final attack statistics if applicable
+        if attack_type != 'none':
+            clean_acc = clean_correct / total_samples * 100
+            adv_acc = adv_correct / total_samples * 100
+            print(f"\nFinal results with {attack_type.upper()} attack:")
+            print(f"Clean accuracy: {clean_acc:.2f}%")
+            print(f"Adversarial accuracy: {adv_acc:.2f}%")
+            print(f"Robustness (adv_acc/clean_acc): {adv_acc/clean_acc*100:.2f}%")
+        
+        return final_acc
 
 
 def main():
@@ -250,7 +231,16 @@ def main():
     # Set random seed
     random.seed(1)
     torch.manual_seed(1)
+    
+    # Create attack configuration
+    attack_config = {
+        'type': args.attack,
+        'epsilon': args.epsilon,
+        'alpha': args.alpha,
+        'iters': args.iters
+    }
 
+    print(f"Attack configuration: {attack_config}")
 
     # Run TDA on each dataset
     datasets = args.datasets.split('/')
@@ -263,8 +253,17 @@ def main():
         
         test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess)
         clip_weights = clip_classifier(classnames, template, clip_model)
-        log_file = f"logs_{dataset_name}_tda_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        acc = run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights, log_file)
+
+        # Pass all three configs to run_test_tda
+        acc = run_test_tda(
+            cfg['positive'], 
+            cfg['negative'], 
+            cfg.get('adverse', {'enabled': False}),  # Use adverse config if present
+            test_loader, 
+            clip_model, 
+            clip_weights,
+            attack_config
+        )
 
 if __name__ == "__main__":
     main()

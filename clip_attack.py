@@ -23,74 +23,118 @@ def parse_args():
     parser.add_argument('--use-fp32', action='store_true', help='Use FP32 precision instead of default')
     return parser.parse_args()
 
-# Safe classification helper that handles float16/32 conversions
 def classify(model, images, text_features):
-    # Make sure images have the correct shape: [batch_size, channels, height, width]
-    if images.dim() == 5:  # If shape is [batch, 1, channels, height, width]
-        images = images.squeeze(1)  # Remove the extra dimension
-        
+    """Helper function for classification with CLIP model."""
     with torch.cuda.amp.autocast(enabled=model.visual.conv1.weight.dtype == torch.float16):
         image_features = model.encode_image(images)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        # cosine similarity scaled by logit_scale
         logits = 100.0 * image_features @ text_features
     return logits
 
-# Attack implementations
 def fgsm_attack(model, images, labels, epsilon, text_features):
-    # Make sure images have the correct shape
-    if images.dim() == 5:  # If shape is [batch, 1, channels, height, width]
-        images = images.squeeze(1)  # Remove the extra dimension
+    """
+    Fast Gradient Sign Method attack.
+    
+    Args:
+        model: CLIP model
+        images: Input images 
+        labels: Target labels
+        epsilon: Attack strength
+        text_features: Text features for classification
         
-    # Convert to float32 for gradient computation
-    images = images.clone().detach().to(torch.float32)
+    Returns:
+        Adversarial examples
+    """
+    # Ensure images are on the same device as the model
+    device = next(model.parameters()).device
+    
+    # Proper handling of batch dimension
+    if images.dim() == 5:  # [batch, 1, channels, height, width]
+        images = images.squeeze(1)
+    
+    # Move to correct device and convert to float
+    images = images.clone().detach().to(device, dtype=torch.float32)
+    labels = labels.to(device)
     images.requires_grad = True
     
     # Forward pass
     logits = classify(model, images, text_features)
-    loss = nn.CrossEntropyLoss()(logits, labels)
     
-    # Compute gradients
+    # Calculate loss
+    loss = F.cross_entropy(logits, labels)
+    
+    # Backward pass
     model.zero_grad()
     loss.backward()
     
     # Create adversarial examples
-    grad_sign = images.grad.sign()
-    adv_images = images + epsilon * grad_sign
-    adv_images = torch.clamp(adv_images, 0, 1).detach()
+    data_grad = images.grad.data
+    sign_data_grad = data_grad.sign()
     
-    return adv_images
+    # Generate perturbed image
+    perturbed_image = images + epsilon * sign_data_grad
+    
+    # Ensure valid image range [0,1]
+    perturbed_image = torch.clamp(perturbed_image, 0, 1)
+    
+    return perturbed_image.detach()
 
 def pgd_attack(model, images, labels, epsilon, alpha, iters, text_features):
-    # Make sure images have the correct shape
-    if images.dim() == 5:  # If shape is [batch, 1, channels, height, width]
-        images = images.squeeze(1)  # Remove the extra dimension
+    """
+    Projected Gradient Descent attack.
+    
+    Args:
+        model: CLIP model
+        images: Input images
+        labels: Target labels
+        epsilon: Maximum perturbation
+        alpha: Step size
+        iters: Number of iterations
+        text_features: Text features for classification
         
-    # Convert to float32 for gradient computation
-    images = images.clone().detach().to(torch.float32)
-    ori_images = images.clone()
+    Returns:
+        Adversarial examples
+    """
+    # Ensure images are on the same device as model
+    device = next(model.parameters()).device
+    
+    # Proper handling of batch dimension
+    if images.dim() == 5:
+        images = images.squeeze(1)
+    
+    # Move to correct device and convert to float
+    images = images.clone().detach().to(device, dtype=torch.float32)
+    labels = labels.to(device)
+    
+    # Save original images for projection step
+    ori_images = images.clone().detach()
     
     for i in range(iters):
-        # Reset gradients each iteration
+        # Reset gradients
         images.requires_grad = True
         
         # Forward pass
         logits = classify(model, images, text_features)
-        loss = nn.CrossEntropyLoss()(logits, labels)
         
-        # Compute gradients
+        # Calculate loss
+        loss = F.cross_entropy(logits, labels)
+        
+        # Backward pass
         model.zero_grad()
         loss.backward()
         
-        # Create adversarial examples (make a new tensor, not in-place)
-        grad_sign = images.grad.sign()
-        images = images.detach() + alpha * grad_sign
+        # Get gradient sign
+        data_grad = images.grad.data
+        sign_data_grad = data_grad.sign()
         
-        # Project back to epsilon ball and valid image range
-        eta = torch.clamp(images - ori_images, min=-epsilon, max=epsilon)
-        images = torch.clamp(ori_images + eta, 0, 1).detach()
+        # Update images
+        images = images.detach() + alpha * sign_data_grad
+        
+        # Project back to epsilon ball
+        eta = torch.clamp(images - ori_images, -epsilon, epsilon)
+        images = torch.clamp(ori_images + eta, 0, 1)
     
-    return images
+    return images.detach()
 
 # Evaluation pipeline
 def evaluate_attack(model, dataloader, attack_fn, attack_params, text_features, attack_name="Attack", device="cuda"):

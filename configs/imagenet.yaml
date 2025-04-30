@@ -19,3 +19,14 @@ negative:
   mask_threshold:
     lower: 0.03
     upper: 1.0
+
+# Adverse cache configuration (for high-sensitivity samples)
+adverse:
+  enabled: true
+  shot_capacity: 2
+  alpha: 0.2
+  beta: 1.0
+  lipschitz_threshold: 0.5  # Threshold for high-sensitivity samples
+  mask_threshold:
+    lower: 0.03
+    upper: 1.0
