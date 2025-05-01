@@ -128,7 +128,7 @@ def get_config_file(config_path, dataset_name):
 def build_test_data_loader(dataset_name, root_path, preprocess, batch_size=1):
     if dataset_name == 'I':
         dataset = ImageNet(root_path, preprocess)
-        test_loader = torch.utils.data.DataLoader(dataset.test, batch_size=batch_size, num_workers=8, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(dataset.test, batch_size=1, num_workers=8, shuffle=True)
     
     elif dataset_name in ['A','V','R','S']:
         preprocess = get_ood_preprocess()
@@ -144,63 +144,3 @@ def build_test_data_loader(dataset_name, root_path, preprocess, batch_size=1):
     
     return test_loader, dataset.classnames, dataset.template
 
-def estimate_lipschitz_for_clip(image_features, clip_weights, max_classes=20):
-    """
-    More efficient Lipschitz estimation that samples classes to reduce computation time.
-    
-    Args:
-        image_features: Normalized image features
-        clip_weights: Classifier weights
-        max_classes: Maximum number of classes to sample for gradient computation
-        
-    Returns:
-        float: Estimated Lipschitz constant
-    """
-    with torch.enable_grad():
-        # Create a copy for gradient computation
-        features = image_features.clone().detach().requires_grad_(True)
-        
-        # Get original logits and probabilities
-        logits = 100.0 * features @ clip_weights
-        probs = F.softmax(logits, dim=-1)
-        
-        # For efficiency, only compute gradients for top classes and some random classes
-        num_classes = probs.size(1)
-        
-        # Get indices of top classes
-        top_k = min(5, num_classes)
-        _, top_indices = torch.topk(probs[0], top_k)
-        
-        # Get some random indices (excluding top classes) for diversity
-        remaining = min(max_classes - top_k, num_classes - top_k)
-        if remaining > 0:
-            # Create all_indices on the same device as top_indices
-            device = top_indices.device
-            all_indices = torch.arange(num_classes, device=device)
-            mask = torch.ones(num_classes, dtype=torch.bool, device=device)
-            mask[top_indices] = False
-            random_indices = all_indices[mask][torch.randperm(num_classes - top_k, device=device)[:remaining]]
-            selected_indices = torch.cat([top_indices, random_indices])
-        else:
-            selected_indices = top_indices
-        
-        # Compute gradients only for selected classes
-        gradient_norms = []
-        
-        for i in selected_indices:
-            # Zero out previous gradients
-            if features.grad is not None:
-                features.grad.zero_()
-                
-            # Compute gradient of this class probability with respect to features
-            probs[0, i].backward(retain_graph=True)
-            
-            # Calculate gradient norm
-            if features.grad is not None:
-                gradient_norm = features.grad.norm(p=2).item()
-                gradient_norms.append(gradient_norm)
-        
-        # The Lipschitz constant is related to the maximum gradient norm
-        lipschitz = 100.0 * max(gradient_norms) if gradient_norms else 0.0
-        
-        return lipschitz

@@ -22,18 +22,17 @@ negative:
 
 # --- Adverse Cache Configuration ---
 adverse:
-  enabled: True
+  enabled: true
   shot_capacity: 2
   alpha: 0.2
   beta: 1.0
-  lipschitz_threshold: 0.5
   mask_threshold:
     lower: 0.03
     upper: 1.0
-  ensemble_thresholds:
-    confidence: 0.75
-    entropy: 1.0
-    gradient_norm: 3.5
-    mahalanobis: 15.0
-    lid: 10.0
-    feature_squeeze: 0.5
+  detection:
+    confidence_threshold: 0.75
+    entropy_threshold: 0.5
+    mahalanobis_threshold: 10.0
+    lid_threshold: 8.0
+    require_misclassification: true
+    penalty_multiplier: 1.5

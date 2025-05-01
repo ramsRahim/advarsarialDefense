@@ -1,4 +1,5 @@
 #!/bin/bash
 CUDA_VISIBLE_DEVICES=0 python tda_runner.py     --config configs \
-                                                --datasets I/A/V/R/S  \
+                                                --datasets A/V/R/S  \
+                                                --attack none \
                                                 --backbone RN50

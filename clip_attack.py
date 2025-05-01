@@ -52,6 +52,12 @@ def fgsm_attack(model, images, labels, epsilon, text_features):
     if images.dim() == 5:  # [batch, 1, channels, height, width]
         images = images.squeeze(1)
     
+
+    if images.size(0) != labels.size(0):
+        if labels.size(0) == 1:
+            # Broadcast the single label to match images batch size
+            labels = labels.repeat(images.size(0))
+
     # Move to correct device and convert to float
     images = images.clone().detach().to(device, dtype=torch.float32)
     labels = labels.to(device)
@@ -99,8 +105,14 @@ def pgd_attack(model, images, labels, epsilon, alpha, iters, text_features):
     device = next(model.parameters()).device
     
     # Proper handling of batch dimension
-    if images.dim() == 5:
+    if images.dim() == 5:  # [batch, 1, channels, height, width]
         images = images.squeeze(1)
+    
+
+    if images.size(0) != labels.size(0):
+        if labels.size(0) == 1:
+            # Broadcast the single label to match images batch size
+            labels = labels.repeat(images.size(0))
     
     # Move to correct device and convert to float
     images = images.clone().detach().to(device, dtype=torch.float32)
@@ -137,7 +149,7 @@ def pgd_attack(model, images, labels, epsilon, alpha, iters, text_features):
     return images.detach()
 
 # Evaluation pipeline
-def evaluate_attack(model, dataloader, attack_fn, attack_params, text_features, attack_name="Attack", device="cuda"):
+def evaluate_attack(model, dataloader, attack_fn, attack_params, text_features, attack_name="fgsm", device="cuda"):
     model.eval()
     total, clean_correct, adv_correct = 0, 0, 0
     
