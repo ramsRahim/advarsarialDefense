@@ -1,4 +1,4 @@
-# Configuration for TDA Hyperparameters
+# TDA Hyperparameters for ImageNet
 
 # --- Positive Cache Configuration ---
 positive:
@@ -10,7 +10,7 @@ positive:
 # --- Negative Cache Configuration ---
 negative:
   enabled: True
-  shot_capacity: 2
+  shot_capacity: 1
   alpha: 0.117
   beta: 1.0
   entropy_threshold:
@@ -20,13 +20,20 @@ negative:
     lower: 0.03
     upper: 1.0
 
-# Adverse cache configuration (for high-sensitivity samples)
+# --- Adverse Cache Configuration ---
 adverse:
-  enabled: true
+  enabled: True
   shot_capacity: 2
   alpha: 0.2
   beta: 1.0
-  lipschitz_threshold: 0.5  # Threshold for high-sensitivity samples
+  lipschitz_threshold: 0.5
   mask_threshold:
     lower: 0.03
     upper: 1.0
+  ensemble_thresholds:
+    confidence: 0.75
+    entropy: 1.0
+    gradient_norm: 3.5
+    mahalanobis: 15.0
+    lid: 10.0
+    feature_squeeze: 0.5

@@ -144,18 +144,14 @@ def build_test_data_loader(dataset_name, root_path, preprocess, batch_size=1):
     
     return test_loader, dataset.classnames, dataset.template
 
-# ...existing code...
-
-def estimate_lipschitz_for_clip(image_features, clip_weights, epsilon=1e-3):
+def estimate_lipschitz_for_clip(image_features, clip_weights, max_classes=20):
     """
-    Estimate Lipschitz constant for a sample in CLIP feature space.
-    Higher values indicate greater sensitivity to perturbations (potential adversarial examples).
+    More efficient Lipschitz estimation that samples classes to reduce computation time.
     
     Args:
         image_features: Normalized image features
-        clip_model: CLIP model
         clip_weights: Classifier weights
-        epsilon: Perturbation magnitude
+        max_classes: Maximum number of classes to sample for gradient computation
         
     Returns:
         float: Estimated Lipschitz constant
@@ -164,23 +160,47 @@ def estimate_lipschitz_for_clip(image_features, clip_weights, epsilon=1e-3):
         # Create a copy for gradient computation
         features = image_features.clone().detach().requires_grad_(True)
         
-        # Get original probabilities
-        logits_orig = 100.0 * features @ clip_weights
-        probs_orig = F.softmax(logits_orig, dim=-1)
+        # Get original logits and probabilities
+        logits = 100.0 * features @ clip_weights
+        probs = F.softmax(logits, dim=-1)
         
-        # Create small perturbation (while keeping on unit sphere)
-        perturbation = torch.randn_like(features)
-        perturbation = perturbation / perturbation.norm(dim=-1, keepdim=True) * epsilon
+        # For efficiency, only compute gradients for top classes and some random classes
+        num_classes = probs.size(1)
         
-        # Apply perturbation and normalize to stay on unit sphere
-        perturbed_features = features + perturbation
-        perturbed_features = perturbed_features / perturbed_features.norm(dim=-1, keepdim=True)
+        # Get indices of top classes
+        top_k = min(5, num_classes)
+        _, top_indices = torch.topk(probs[0], top_k)
         
-        # Get perturbed probabilities
-        logits_pert = 100.0 * perturbed_features @ clip_weights
-        probs_pert = F.softmax(logits_pert, dim=-1)
+        # Get some random indices (excluding top classes) for diversity
+        remaining = min(max_classes - top_k, num_classes - top_k)
+        if remaining > 0:
+            # Create all_indices on the same device as top_indices
+            device = top_indices.device
+            all_indices = torch.arange(num_classes, device=device)
+            mask = torch.ones(num_classes, dtype=torch.bool, device=device)
+            mask[top_indices] = False
+            random_indices = all_indices[mask][torch.randperm(num_classes - top_k, device=device)[:remaining]]
+            selected_indices = torch.cat([top_indices, random_indices])
+        else:
+            selected_indices = top_indices
         
-        # Calculate output change divided by input change
-        lipschitz = (probs_pert - probs_orig).norm(p=2) / epsilon
+        # Compute gradients only for selected classes
+        gradient_norms = []
         
-        return lipschitz.item()
+        for i in selected_indices:
+            # Zero out previous gradients
+            if features.grad is not None:
+                features.grad.zero_()
+                
+            # Compute gradient of this class probability with respect to features
+            probs[0, i].backward(retain_graph=True)
+            
+            # Calculate gradient norm
+            if features.grad is not None:
+                gradient_norm = features.grad.norm(p=2).item()
+                gradient_norms.append(gradient_norm)
+        
+        # The Lipschitz constant is related to the maximum gradient norm
+        lipschitz = 100.0 * max(gradient_norms) if gradient_norms else 0.0
+        
+        return lipschitz
