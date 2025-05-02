@@ -10,7 +10,7 @@ import operator
 from clip_attack import fgsm_attack, pgd_attack
 import clip
 from utils import *
-from adversarial_detector import AdversarialDetector
+from mlp_adversarial_detector import AdversarialClassifier,FeatureExtractor
 
 def get_arguments():
     """Get arguments of the test-time adaptation."""
@@ -29,6 +29,23 @@ def get_arguments():
     args = parser.parse_args()
 
     return args
+
+def load_mlp_detector(model_path='adversarial_mlp_detector_no_mahalanobis.pth'):
+    """Load a trained MLP adversarial detector model"""
+    # Load saved model
+    saved_data = torch.load(model_path)
+    
+    # Create model with the same architecture (3 features input)
+    detector = AdversarialClassifier(input_dim=2)
+    
+    # Load saved state
+    detector.load_state_dict(saved_data['model_state_dict'])
+    
+    # Move to same device as CLIP model
+    detector.eval()
+    
+    # Return model and normalization parameters
+    return detector, saved_data['feature_mean'], saved_data['feature_std']
 
 
 def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
@@ -69,7 +86,7 @@ def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_m
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
         return alpha * cache_logits
 
-def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, attack_config=None , log_path=None):
+def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, attack_config=None, log_path=None):
     with open(log_path, 'w') as log:
         with torch.no_grad():
             # Initialize caches and stats
@@ -93,41 +110,24 @@ def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, at
                 # Extract basic parameters for adverse cache
                 adv_params = {k: adv_cfg[k] for k in ['shot_capacity', 'alpha', 'beta', 'mask_threshold']}
                 
-                # Get detection parameters - handle both old and new config formats
+                # Get detection parameters
                 detection_params = adv_cfg.get('detection', {})
                 
-                if detection_params:
-                    # New configuration format with 'detection' key
-                    detector_thresholds = {
-                        'confidence': detection_params.get('confidence_threshold', 0.75),
-                        'entropy': detection_params.get('entropy_threshold', 0.5),
-                        # Add new metrics from enhanced detector
-                        'mahalanobis': detection_params.get('mahalanobis_threshold', 10.0),
-                        'lid': detection_params.get('lid_threshold', 8.0)
-                    }
-                    # Get penalty multiplier
-                    penalty_multiplier = detection_params.get('penalty_multiplier', 1.5)
-                    # Whether to require misclassification
-                    require_misclassification = detection_params.get('require_misclassification', True)
-                else:
-                    # Legacy configuration format
-                    ensemble_thresholds = adv_cfg.get('ensemble_thresholds', {})
-                    detector_thresholds = {
-                        'confidence': ensemble_thresholds.get('confidence', 0.75),
-                        'entropy': ensemble_thresholds.get('entropy', 0.5),
-                        'mahalanobis': ensemble_thresholds.get('mahalanobis', 10.0),
-                        'lid': ensemble_thresholds.get('lid', 8.0)
-                    }
-                    penalty_multiplier = 1.5  # Default
-                    require_misclassification = True  # Default
+                # Load the MLP detector
+                mlp_detector, feature_mean, feature_std = load_mlp_detector()
+                mlp_detector = mlp_detector.to(next(clip_model.parameters()).device)
                 
-                # Initialize enhanced detector with thresholds
-                detector = AdversarialDetector(
-                    clip_model, 
-                    clip_weights, 
-                    thresholds=detector_thresholds,
-                    require_misclassification=require_misclassification
-                )
+                # Initialize feature extractor for MLP input
+                feature_extractor = FeatureExtractor(clip_model, clip_weights)
+                
+                # Get penalty multiplier
+                penalty_multiplier = detection_params.get('penalty_multiplier', 1.5)
+                
+                # Set detection threshold (defaults to 0.5)
+                detection_threshold = detection_params.get('detection_threshold', 0.5)
+                
+                print(f"Using MLP adversarial detector with threshold: {detection_threshold}")
+                log.write(f"Using MLP adversarial detector with threshold: {detection_threshold}\n")
 
             # Set up attack
             attack_type = attack_config.get('type', 'none') if attack_config else 'none'
@@ -155,7 +155,6 @@ def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, at
                     # Images have shape [batch_size, 1, channels, height, width]
                     # We need to squeeze out that extra dimension
                     images = images.squeeze(1)
-                    print(f"Squeezed image tensor from 5D to 4D, new shape: {images.shape}")
 
                 # Handle target similarly if needed
                 if isinstance(target, list):
@@ -225,11 +224,32 @@ def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, at
                                 [image_features[j:j+1], sample_loss], 
                                 pos_params['shot_capacity'])
 
-                # Check for adversarial examples using enhanced detector
+                # Check for adversarial examples using MLP detector
                 if adv_enabled:
-                    # Use enhanced detector with Mahalanobis and LID metrics
-                    detection_results = detector.detect(adv_images, target)
-                    is_adversarial = detection_results['is_adversarial']
+                    # Extract features for MLP detector
+                    features_dict = feature_extractor.extract_features(adv_images, target, is_clean=False, update_reference=False)
+                    
+                    # Create feature tensor (without Mahalanobis distance)
+                    feature_tensor = torch.stack([
+                        features_dict['confidence'],
+                        features_dict['entropy'],
+                        #features_dict['lid']
+                    ], dim=1)
+                    
+                    # Normalize using stored mean and std
+                    feature_mean_device = feature_mean.to(feature_tensor.device)
+                    feature_std_device = feature_std.to(feature_tensor.device)
+                    normalized_features = (feature_tensor - feature_mean_device) / (feature_std_device + 1e-8)
+                    
+                    #print(f"Normalized features: {normalized_features}")
+                    # Handle potential NaN/Inf values
+                    normalized_features = torch.nan_to_num(normalized_features, nan=0.0, posinf=1e6, neginf=-1e6)
+                    #print(f"Normalized features after NaN handling: {normalized_features}")
+                    # Get detection results
+                    detection_scores = mlp_detector(normalized_features).squeeze(dim=-1)
+                    #print(f"Detection scores: {detection_scores}")
+                    #print(f"Detection threshold: {detection_threshold}")
+                    is_adversarial = (detection_scores >= detection_threshold)
                     
                     # Count detected adversarial examples
                     if attack_type != 'none':
@@ -246,10 +266,10 @@ def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, at
                             # Log detection details occasionally for debugging
                             if i % 200 == 0 and j == 0:  # Just log the first one in the batch occasionally
                                 print(f"\nAdversarial sample detected - Details:")
-                                print(f"  Confidence: {detection_results['confidence'][j]:.4f} (threshold: {detector.conf_threshold:.4f})")
-                                print(f"  Entropy: {detection_results['entropy'][j]:.4f} (threshold: {detector.entropy_threshold:.4f})")
-                                print(f"  Mahalanobis: {detection_results['mahalanobis'][j]:.4f} (threshold: {detector.mahalanobis_threshold:.4f})")
-                                print(f"  LID: {detection_results['lid'][j]:.4f} (threshold: {detector.lid_threshold:.4f})")
+                                print(f"  MLP Score: {detection_scores[j]:.4f} (threshold: {detection_threshold:.4f})")
+                                print(f"  Confidence: {features_dict['confidence'][j]:.4f}")
+                                print(f"  Entropy: {features_dict['entropy'][j]:.4f}")
+                                #print(f"  LID: {features_dict['lid'][j]:.4f}")
                 
                 # Check for negative cache
                 if neg_enabled:
@@ -335,26 +355,26 @@ def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, at
         print("---- TDA's test accuracy: {:.2f}%. ----".format(final_acc))
         log.write("---- TDA's test accuracy: {:.2f}%. ----\n".format(final_acc))
         
-    # Print final attack statistics if applicable
-    if attack_type != 'none':
-        clean_acc = clean_correct / total_samples * 100
-        adv_acc = adv_correct / total_samples * 100
-        detect_rate = adv_detected / total_samples * 100 if total_samples > 0 else 0
+        # Print final attack statistics if applicable
+        if attack_type != 'none':
+            clean_acc = clean_correct / total_samples * 100
+            adv_acc = adv_correct / total_samples * 100
+            detect_rate = adv_detected / total_samples * 100 if total_samples > 0 else 0
+            
+            log.write(f"\nFinal results with {attack_type.upper()} attack:\n")
+            log.write(f"Clean accuracy: {clean_acc:.2f}%\n")
+            log.write(f"Adversarial accuracy: {adv_acc:.2f}%\n")
+            log.write(f"Adversarial detection rate: {detect_rate:.2f}%\n")
+            log.write(f"Robustness (adv_acc/clean_acc): {adv_acc/clean_acc*100:.2f}%\n")
         
-        log.write(f"\nFinal results with {attack_type.upper()} attack:")
-        log.write(f"Clean accuracy: {clean_acc:.2f}%")
-        log.write(f"Adversarial accuracy: {adv_acc:.2f}%")
-        log.write(f"Adversarial detection rate: {detect_rate:.2f}%")
-        log.write(f"Robustness (adv_acc/clean_acc): {adv_acc/clean_acc*100:.2f}%")
-    
-    # Print cache statistics
-    log.write("\nCache Statistics:")
-    if pos_enabled:
-        log.write(f"Positive cache entries: {sum(len(v) for v in pos_cache.values())}")
-    if neg_enabled:
-        log.write(f"Negative cache entries: {sum(len(v) for v in neg_cache.values())}")
-    if adv_enabled:
-        log.write(f"Adverse cache entries: {sum(len(v) for v in adv_cache.values())}")
+        # Print cache statistics
+        log.write("\nCache Statistics:\n")
+        if pos_enabled:
+            log.write(f"Positive cache entries: {sum(len(v) for v in pos_cache.values())}\n")
+        if neg_enabled:
+            log.write(f"Negative cache entries: {sum(len(v) for v in neg_cache.values())}\n")
+        if adv_enabled:
+            log.write(f"Adverse cache entries: {sum(len(v) for v in adv_cache.values())}\n")
     
     return final_acc
 
