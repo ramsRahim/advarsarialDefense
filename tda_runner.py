@@ -220,12 +220,19 @@ def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, at
                 batch_size = images.size(0)
                 
                 # Update positive cache (one entry per sample in batch)
+                # if pos_enabled:
+                #     for j in range(batch_size):
+                #         # Use individual confidence as loss
+                #         sample_loss = -confidence[j].item()
+                #         update_cache(pos_cache, pred[j].item(), 
+                #                 [image_features[j:j+1], sample_loss], 
+                #                 pos_params['shot_capacity'])
                 if pos_enabled:
                     for j in range(batch_size):
                         # Use individual confidence as loss
-                        sample_loss = -confidence[j].item()
-                        update_cache(pos_cache, pred[j].item(), 
-                                [image_features[j:j+1], sample_loss], 
+                        sample_loss = -clean_confidence[j].item()
+                        update_cache(pos_cache, clean_pred[j].item(),
+                                [clean_image_features[j:j+1], sample_loss], 
                                 pos_params['shot_capacity'])
 
                 # Check for adversarial examples using MLP detector
