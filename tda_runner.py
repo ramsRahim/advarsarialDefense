@@ -169,6 +169,10 @@ def run_test_tda(pos_cfg, neg_cfg, adv_cfg, loader, clip_model, clip_weights, at
                 clean_image_features = clip_model.encode_image(images)
                 clean_image_features = clean_image_features / clean_image_features.norm(dim=-1, keepdim=True)
                 clean_logits = 100.0 * clean_image_features @ clip_weights
+                clean_prob_map = F.softmax(clean_logits, dim=1)
+                clean_confidence = clean_prob_map.max(dim=1)[0]
+                clean_entropy = -torch.sum(clean_prob_map * torch.log(clean_prob_map + 1e-10), dim=1)
+                clean_loss = -clean_confidence.mean()  # Higher confidence = lower loss
                 clean_pred = clean_logits.argmax(dim=1)
                 clean_correct += (clean_pred == target).sum().item()
                 
