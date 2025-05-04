@@ -454,7 +454,7 @@ def main():
     
     # Load dataset
     print("Loading dataset...")
-    data_loader, classnames, template = build_test_data_loader('I', './dataset/', preprocess)
+    data_loader, classnames, template = build_test_data_loader('I', './dataset/', preprocess, batch_size=32)
     text_features = clip_classifier(classnames, template, model)
     
     # Collect features
